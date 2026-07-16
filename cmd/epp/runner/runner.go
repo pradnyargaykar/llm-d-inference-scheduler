@@ -117,6 +117,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/nohitlru"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/preciseprefixcache"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/prefix"
+	programawarescorer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/programaware"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/queuedepth"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/runningrequests"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/sessionaffinity"
@@ -483,6 +484,7 @@ func (r *Runner) registerInTreePlugins() {
 	fwkplugin.Register(attrmodels.ModelsExtractorType, extmodels.ModelServerExtractorFactory)
 
 	fwkplugin.Register(prefix.PrefixCacheScorerPluginType, prefix.PrefixCachePluginFactory)
+	fwkplugin.Register(programawarescorer.ProgramAwareScorerPluginType, programawarescorer.ProgramAwareScorerPluginFactory)
 	fwkplugin.Register(maxscore.MaxScorePickerType, maxscore.MaxScorePickerFactory)
 	fwkplugin.Register(random.RandomPickerType, random.RandomPickerFactory)
 	fwkplugin.Register(weightedrandom.WeightedRandomPickerType, weightedrandom.WeightedRandomPickerFactory)

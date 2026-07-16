@@ -1,17 +1,53 @@
-# ------------------------------------------------------------------------------
-# EPD (No Disaggregation) Development Environment
-#
-# Single deployment handling all stages. No routing sidecar — vLLM listens
-# directly on port 8000.
+1# ------------------------------------------------------------------------------
+# EPD (No Disaggregation) Development Environment - Day 1 Sandbox Setup
 # ------------------------------------------------------------------------------
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-- ../../../components/vllm-decode/
+# - ../../../components/vllm-decode/
+- ../../../components/inference-gateway/
+
+configMapGenerator:
+- name: epp-config
+  files:
+  - epp-config.yaml=sim-prefix-cache-config.yaml
 
 patches:
-- path: patch-decode.yaml
-
-components:
-- ../../../components/overlays/simulator/
+# - path: patch-decode.yaml
+# - path: patch-remove-render.yaml  # Commented out to deploy WITH render service
+- path: patch-add-pod-env.yaml
+# - path: patch-fix-render-model.yaml  # Fix render model to match vLLM backends (7B)
+- target:
+    kind: Deployment
+    # This targets your team's base template deployment using its exact unparsed name placeholder
+    name: \${EPP_NAME}
+  patch: |
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: inference-gateway
+    spec:
+      template:
+        spec:
+          serviceAccountName: inference-gateway
+          containers:
+          - name: epp
+            image: epp-scheduler:local
+            imagePullPolicy: Never
+            args:
+            - --endpoint-selector
+            - "app=vllm-qwen3-32b"
+            - --endpoint-target-ports
+            - "8000"
+            - --v
+            - "5"
+            - --zap-encoder
+            - "json"
+            - --grpc-port
+            - "9002"
+            - --grpc-health-port
+            - "9003"
+            - --config-file
+            - "/etc/epp/epp-config.yaml"
+            - --metrics-endpoint-auth=false

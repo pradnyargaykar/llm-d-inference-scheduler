@@ -1,0 +1,15 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${EPP_NAME}
+spec:
+  template:
+    spec:
+      containers:
+      - name: vllm-render
+        $patch: delete
+      volumes:
+      - name: model-cache
+        $patch: delete
+
+# Made with Bob

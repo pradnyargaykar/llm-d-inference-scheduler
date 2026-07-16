@@ -17,8 +17,6 @@ limitations under the License.
 package preciseprefixcache
 
 import (
-	"fmt"
-
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
@@ -31,7 +29,7 @@ func extractEndpointSet(endpoints []scheduling.Endpoint) sets.Set[string] {
 	endpointSet := sets.New[string]()
 	for _, ep := range endpoints {
 		if m := ep.GetMetadata(); m != nil {
-			endpointSet.Insert(fmt.Sprintf("%s:%s", m.Address, m.Port))
+			endpointSet.Insert(m.Address)
 		}
 	}
 	return endpointSet

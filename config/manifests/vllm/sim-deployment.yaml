@@ -3,7 +3,7 @@ kind: Deployment
 metadata:
   name: vllm-qwen3-32b
 spec:
-  replicas: 3
+  replicas: 4  # 👈 Update this to 4 replicas
   selector:
     matchLabels:
       app: vllm-qwen3-32b
@@ -12,6 +12,7 @@ spec:
       labels:
         app: vllm-qwen3-32b
         llm-d.ai/engine-type: vllm
+        release: monitoring
     spec:
       containers:
       - name: vllm-sim
@@ -19,26 +20,38 @@ spec:
         imagePullPolicy: Always
         args:
         - --model
-        - Qwen/Qwen3-32B
+        - "Qwen/Qwen2.5-7B-Instruct"  # 👈 Set to your targeted Qwen model
+        - --served-model-name
+        - "Qwen/Qwen2.5-7B-Instruct"
         - --port
-        - "8000"
-        - --max-loras
-        - "2"
-        - --lora-modules
-        - '{"name": "food-review-1"}'
-        env:
-        - name: POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
-        - name: NAMESPACE
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.namespace
+        - "8000"                      # 👈 Inside K8s, they can ALL safely use 8000!
+        - --time-to-first-token
+        - "18ms"
+        - --inter-token-latency
+        - "10ms"
+        - --enable-kvcache
+        - "true"
+        - --enable-prefix-caching
+        - --block-size
+        - "16"
+        - --kv-cache-size
+        - "4096"
+        - --max-num-seqs
+        - "32"
+        - --max-model-len
+        - "32768"
+        - --mode
+        - "echo"
+        - --render-url
+        - "http://vllm-render.default.svc.cluster.local:8082"
+        - --zmq-endpoint
+        - "tcp://inference-gateway.default.svc.cluster.local:5557"
         ports:
-        - containerPort: 8000
-          name: http
+        - name: metrics
+          containerPort: 8000
           protocol: TCP
-        resources:
-          requests:
-            cpu: 10m
+        env:
+        - name: POD_IP                # 👈 Crucial fix: provide the network interface injection
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP

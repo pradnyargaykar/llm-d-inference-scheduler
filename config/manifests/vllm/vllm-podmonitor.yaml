@@ -1,0 +1,22 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: vllm-sim-metrics
+  namespace: default
+  labels:
+    release: monitoring          # required — Prometheus selector is matchLabels: release=monitoring
+spec:
+  selector:
+    matchLabels:
+      app: vllm-qwen3-32b
+  podMetricsEndpoints:
+  - port: metrics                # matches containerPort name added to sim-deployment.yaml
+    path: /metrics
+    interval: 15s
+    scrapeTimeout: 10s
+    relabelings:
+    # Keep pod name as a label so per-pod plots are readable
+    - sourceLabels: [__meta_kubernetes_pod_name]
+      targetLabel: vllm_pod
+    - sourceLabels: [__meta_kubernetes_pod_ip]
+      targetLabel: vllm_pod_ip

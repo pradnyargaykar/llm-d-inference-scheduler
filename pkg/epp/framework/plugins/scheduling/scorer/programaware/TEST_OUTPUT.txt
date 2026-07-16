@@ -1,0 +1,335 @@
+=== RUN   TestNewBudgetTracker
+=== RUN   TestNewBudgetTracker/valid_budget
+2026/06/17 12:59:57 BudgetTracker initialized with uniform budget: 1000 requests per program per pod
+2026/06/17 12:59:57 BudgetTracker stopped
+=== RUN   TestNewBudgetTracker/zero_budget_defaults_to_1000
+2026/06/17 12:59:57 Budget cleanup loop started (interval=1m0s, timeout=5m0s)
+2026/06/17 12:59:57 Warning: defaultBudget=0 is invalid, using default of 1000
+2026/06/17 12:59:57 BudgetTracker initialized with uniform budget: 1000 requests per program per pod
+2026/06/17 12:59:57 BudgetTracker stopped
+2026/06/17 12:59:57 Budget cleanup loop started (interval=1m0s, timeout=5m0s)
+=== RUN   TestNewBudgetTracker/negative_budget_defaults_to_1000
+2026/06/17 12:59:57 Warning: defaultBudget=-100 is invalid, using default of 1000
+2026/06/17 12:59:57 BudgetTracker initialized with uniform budget: 1000 requests per program per pod
+2026/06/17 12:59:57 BudgetTracker stopped
+2026/06/17 12:59:57 Budget cleanup loop started (interval=1m0s, timeout=5m0s)
+--- PASS: TestNewBudgetTracker (0.00s)
+    --- PASS: TestNewBudgetTracker/valid_budget (0.00s)
+    --- PASS: TestNewBudgetTracker/zero_budget_defaults_to_1000 (0.00s)
+    --- PASS: TestNewBudgetTracker/negative_budget_defaults_to_1000 (0.00s)
+=== RUN   TestReserveAutoCreation
+2026/06/17 12:59:57 BudgetTracker initialized with uniform budget: 1000 requests per program per pod
+2026/06/17 12:59:57 Auto-created budget map for program: program-a
+2026/06/17 12:59:57 Auto-created budget for program=program-a pod=pod-1 with default=1000 requests
+2026/06/17 12:59:57 Reserved budget: requestID=req-001 program=program-a pod=pod-1 (total=1000 used=0 reserved=1 available=999)
+2026/06/17 12:59:57 BudgetTracker stopped
+--- PASS: TestReserveAutoCreation (0.00s)
+2026/06/17 12:59:57 Budget cleanup loop started (interval=1m0s, timeout=5m0s)
+=== RUN   TestFirstRequestDetection
+2026/06/17 12:59:57 BudgetTracker initialized with uniform budget: 1000 requests per program per pod
+2026/06/17 12:59:57 Auto-created budget map for program: program-a
+2026/06/17 12:59:57 Budget cleanup loop stopped
+2026/06/17 12:59:57 Auto-created budget for program=program-a pod=pod-1 with default=1000 requests
+2026/06/17 12:59:57 Reserved budget: requestID=req-001 program=program-a pod=pod-1 (total=1000 used=0 reserved=1 available=999)
+2026/06/17 12:59:57 BudgetTracker stopped
+--- PASS: TestFirstRequestDetection (0.00s)
+2026/06/17 12:59:57 Budget cleanup loop started (interval=1m0s, timeout=5m0s)
+=== RUN   TestReserve
+2026/06/17 12:59:57 Budget cleanup loop stopped
+2026/06/17 12:59:57 BudgetTracker initialized with uniform budget: 100 requests per program per pod
+2026/06/17 12:59:57 Auto-created budget map for program: program-a
+2026/06/17 12:59:57 Auto-created budget for program=program-a pod=pod-1 with default=100 requests
+2026/06/17 12:59:57 Reserved budget: requestID=req-001 program=program-a pod=pod-1 (total=100 used=0 reserved=1 available=99)
+2026/06/17 12:59:57 Reserved budget: requestID=req-002 program=program-a pod=pod-1 (total=100 used=0 reserved=2 available=98)
+2026/06/17 12:59:57 Reserved budget: requestID=req-003 program=program-a pod=pod-1 (total=100 used=0 reserved=3 available=97)
+2026/06/17 12:59:57 BudgetTracker stopped
+--- PASS: TestReserve (0.00s)
+2026/06/17 12:59:57 Budget cleanup loop started (interval=1m0s, timeout=5m0s)
+2026/06/17 12:59:57 Budget cleanup loop stopped
+=== RUN   TestReserveInsufficientBudget
+2026/06/17 12:59:57 BudgetTracker initialized with uniform budget: 2 requests per program per pod
+2026/06/17 12:59:57 Auto-created budget map for program: program-a
+2026/06/17 12:59:57 Budget cleanup loop started (interval=1m0s, timeout=5m0s)
+2026/06/17 12:59:57 Auto-created budget for program=program-a pod=pod-1 with default=2 requests
+2026/06/17 12:59:57 Reserved budget: requestID=req-001 program=program-a pod=pod-1 (total=2 used=0 reserved=1 available=1)
+2026/06/17 12:59:57 Reserved budget: requestID=req-002 program=program-a pod=pod-1 (total=2 used=0 reserved=2 available=0)
+2026/06/17 12:59:57 BudgetTracker stopped
+--- PASS: TestReserveInsufficientBudget (0.00s)
+2026/06/17 12:59:57 Budget cleanup loop stopped
+=== RUN   TestGetAvailable
+2026/06/17 12:59:57 BudgetTracker initialized with uniform budget: 100 requests per program per pod
+2026/06/17 12:59:57 Auto-created budget map for program: program-a
+2026/06/17 12:59:57 Auto-created budget for program=program-a pod=pod-1 with default=100 requests
+2026/06/17 12:59:57 Reserved budget: requestID=req-001 program=program-a pod=pod-1 (total=100 used=0 reserved=1 available=99)
+2026/06/17 12:59:57 BudgetTracker stopped
+--- PASS: TestGetAvailable (0.00s)
+2026/06/17 12:59:57 Budget cleanup loop started (interval=1m0s, timeout=5m0s)
+2026/06/17 12:59:57 Budget cleanup loop stopped
+=== RUN   TestReleaseAndDeduct
+2026/06/17 12:59:57 BudgetTracker initialized with uniform budget: 100 requests per program per pod
+2026/06/17 12:59:57 Auto-created budget map for program: program-a
+2026/06/17 12:59:57 Auto-created budget for program=program-a pod=pod-1 with default=100 requests
+2026/06/17 12:59:57 Reserved budget: requestID=req-001 program=program-a pod=pod-1 (total=100 used=0 reserved=1 available=99)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-001 program=program-a pod=pod-1 duration=17.709µs (total=100 used=1 reserved=0)
+2026/06/17 12:59:57 BudgetTracker stopped
+--- PASS: TestReleaseAndDeduct (0.00s)
+2026/06/17 12:59:57 Budget cleanup loop started (interval=1m0s, timeout=5m0s)
+2026/06/17 12:59:57 Budget cleanup loop stopped
+=== RUN   TestMultipleProgramsAndPods
+2026/06/17 12:59:57 BudgetTracker initialized with uniform budget: 100 requests per program per pod
+2026/06/17 12:59:57 Auto-created budget map for program: program-a
+2026/06/17 12:59:57 Auto-created budget for program=program-a pod=pod-1 with default=100 requests
+2026/06/17 12:59:57 Reserved budget: requestID=req-001 program=program-a pod=pod-1 (total=100 used=0 reserved=1 available=99)
+2026/06/17 12:59:57 Auto-created budget for program=program-a pod=pod-2 with default=100 requests
+2026/06/17 12:59:57 Reserved budget: requestID=req-002 program=program-a pod=pod-2 (total=100 used=0 reserved=1 available=99)
+2026/06/17 12:59:57 Auto-created budget map for program: program-b
+2026/06/17 12:59:57 Auto-created budget for program=program-b pod=pod-1 with default=100 requests
+2026/06/17 12:59:57 Reserved budget: requestID=req-003 program=program-b pod=pod-1 (total=100 used=0 reserved=1 available=99)
+2026/06/17 12:59:57 Auto-created budget for program=program-b pod=pod-2 with default=100 requests
+2026/06/17 12:59:57 Reserved budget: requestID=req-004 program=program-b pod=pod-2 (total=100 used=0 reserved=1 available=99)
+2026/06/17 12:59:57 BudgetTracker stopped
+--- PASS: TestMultipleProgramsAndPods (0.00s)
+2026/06/17 12:59:57 Budget cleanup loop started (interval=1m0s, timeout=5m0s)
+2026/06/17 12:59:57 Budget cleanup loop stopped
+=== RUN   TestConcurrentReserve
+2026/06/17 12:59:57 BudgetTracker initialized with uniform budget: 1000 requests per program per pod
+2026/06/17 12:59:57 Auto-created budget map for program: program-a
+2026/06/17 12:59:57 Auto-created budget for program=program-a pod=pod-1 with default=1000 requests
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=1 available=999)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=2 available=998)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=3 available=997)
+2026/06/17 12:59:57 Budget cleanup loop started (interval=1m0s, timeout=5m0s)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=4 available=996)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=5 available=995)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=6 available=994)
+2026/06/17 12:59:57 Reserved budget: requestID=req-! program=program-a pod=pod-1 (total=1000 used=0 reserved=7 available=993)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=8 available=992)
+2026/06/17 12:59:57 Reserved budget: requestID=req-	 program=program-a pod=pod-1 (total=1000 used=0 reserved=9 available=991)
+2026/06/17 12:59:57 Reserved budget: requestID=req-
+ program=program-a pod=pod-1 (total=1000 used=0 reserved=10 available=990)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=11 available=989)
+2026/06/17 12:59:57 Reserved budget: requestID=req-, program=program-a pod=pod-1 (total=1000 used=0 reserved=12 available=988)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=13 available=987)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=14 available=986)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=15 available=985)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=16 available=984)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=17 available=983)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=18 available=982)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=19 available=981)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=20 available=980)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=21 available=979)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=22 available=978)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=23 available=977)
+2026/06/17 12:59:57 Reserved budget: requestID=req-c program=program-a pod=pod-1 (total=1000 used=0 reserved=24 available=976)
+2026/06/17 12:59:57 Reserved budget: requestID=req-> program=program-a pod=pod-1 (total=1000 used=0 reserved=25 available=975)
+2026/06/17 12:59:57 Reserved budget: requestID=req-= program=program-a pod=pod-1 (total=1000 used=0 reserved=26 available=974)
+2026/06/17 12:59:57 Reserved budget: requestID=req-  program=program-a pod=pod-1 (total=1000 used=0 reserved=27 available=973)
+2026/06/17 12:59:57 Reserved budget: requestID=req-? program=program-a pod=pod-1 (total=1000 used=0 reserved=28 available=972)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=29 available=971)
+2026/06/17 12:59:57 Reserved budget: requestID=req-Q program=program-a pod=pod-1 (total=1000 used=0 reserved=30 available=970)
+2026/06/17 12:59:57 Reserved budget: requestID=req-R program=program-a pod=pod-1 (total=1000 used=0 reserved=31 available=969)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=32 available=968)
+2026/06/17 12:59:57 Reserved budget: requestID=req-@ program=program-a pod=pod-1 (total=1000 used=0 reserved=33 available=967)
+2026/06/17 12:59:57 Reserved budget: requestID=req-A program=program-a pod=pod-1 (total=1000 used=0 reserved=34 available=966)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=35 available=965)
+2026/06/17 12:59:57 Reserved budget: requestID=req-B program=program-a pod=pod-1 (total=1000 used=0 reserved=36 available=964)
+2026/06/17 12:59:57 Reserved budget: requestID=req-S program=program-a pod=pod-1 (total=1000 used=0 reserved=37 available=963)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=38 available=962)
+2026/06/17 12:59:57 Reserved budget: requestID=req-C program=program-a pod=pod-1 (total=1000 used=0 reserved=39 available=961)
+2026/06/17 12:59:57 Reserved budget: requestID=req-T program=program-a pod=pod-1 (total=1000 used=0 reserved=40 available=960)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=41 available=959)
+2026/06/17 12:59:57 Reserved budget: requestID=req-D program=program-a pod=pod-1 (total=1000 used=0 reserved=42 available=958)
+2026/06/17 12:59:57 Reserved budget: requestID=req-U program=program-a pod=pod-1 (total=1000 used=0 reserved=43 available=957)
+2026/06/17 12:59:57 Reserved budget: requestID=req-E program=program-a pod=pod-1 (total=1000 used=0 reserved=44 available=956)
+2026/06/17 12:59:57 Reserved budget: requestID=req-V program=program-a pod=pod-1 (total=1000 used=0 reserved=45 available=955)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=46 available=954)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=47 available=953)
+2026/06/17 12:59:57 Reserved budget: requestID=req-  program=program-a pod=pod-1 (total=1000 used=0 reserved=48 available=952)
+2026/06/17 12:59:57 Reserved budget: requestID=req-F program=program-a pod=pod-1 (total=1000 used=0 reserved=49 available=951)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=50 available=950)
+2026/06/17 12:59:57 Reserved budget: requestID=req-G program=program-a pod=pod-1 (total=1000 used=0 reserved=51 available=949)
+2026/06/17 12:59:57 Reserved budget: requestID=req-] program=program-a pod=pod-1 (total=1000 used=0 reserved=52 available=948)
+2026/06/17 12:59:57 Reserved budget: requestID=req-X program=program-a pod=pod-1 (total=1000 used=0 reserved=53 available=947)
+2026/06/17 12:59:57 Reserved budget: requestID=req-Y program=program-a pod=pod-1 (total=1000 used=0 reserved=54 available=946)
+2026/06/17 12:59:57 Reserved budget: requestID=req-Z program=program-a pod=pod-1 (total=1000 used=0 reserved=55 available=945)
+2026/06/17 12:59:57 Reserved budget: requestID=req-[ program=program-a pod=pod-1 (total=1000 used=0 reserved=56 available=944)
+2026/06/17 12:59:57 Reserved budget: requestID=req-H program=program-a pod=pod-1 (total=1000 used=0 reserved=57 available=943)
+2026/06/17 12:59:57 Reserved budget: requestID=req-I program=program-a pod=pod-1 (total=1000 used=0 reserved=58 available=942)
+2026/06/17 12:59:57 Reserved budget: requestID=req-\ program=program-a pod=pod-1 (total=1000 used=0 reserved=59 available=941)
+2026/06/17 12:59:57 Reserved budget: requestID=req-` program=program-a pod=pod-1 (total=1000 used=0 reserved=60 available=940)
+2026/06/17 12:59:57 Reserved budget: requestID=req-^ program=program-a pod=pod-1 (total=1000 used=0 reserved=61 available=939)
+2026/06/17 12:59:57 Reserved budget: requestID=req-_ program=program-a pod=pod-1 (total=1000 used=0 reserved=62 available=938)
+2026/06/17 12:59:57 Reserved budget: requestID=req-W program=program-a pod=pod-1 (total=1000 used=0 reserved=63 available=937)
+2026/06/17 12:59:57 Reserved budget: requestID=req-a program=program-a pod=pod-1 (total=1000 used=0 reserved=64 available=936)
+2026/06/17 12:59:57 Reserved budget: requestID=req-b program=program-a pod=pod-1 (total=1000 used=0 reserved=65 available=935)
+2026/06/17 12:59:57 Reserved budget: requestID=req-J program=program-a pod=pod-1 (total=1000 used=0 reserved=66 available=934)
+2026/06/17 12:59:57 Reserved budget: requestID=req-M program=program-a pod=pod-1 (total=1000 used=0 reserved=67 available=933)
+2026/06/17 12:59:57 Reserved budget: requestID=req-N program=program-a pod=pod-1 (total=1000 used=0 reserved=68 available=932)
+2026/06/17 12:59:57 Reserved budget: requestID=req-/ program=program-a pod=pod-1 (total=1000 used=0 reserved=69 available=931)
+2026/06/17 12:59:57 Reserved budget: requestID=req-K program=program-a pod=pod-1 (total=1000 used=0 reserved=70 available=930)
+2026/06/17 12:59:57 Reserved budget: requestID=req-O program=program-a pod=pod-1 (total=1000 used=0 reserved=71 available=929)
+2026/06/17 12:59:57 Reserved budget: requestID=req-" program=program-a pod=pod-1 (total=1000 used=0 reserved=72 available=928)
+2026/06/17 12:59:57 Reserved budget: requestID=req-P program=program-a pod=pod-1 (total=1000 used=0 reserved=73 available=927)
+2026/06/17 12:59:57 Reserved budget: requestID=req-L program=program-a pod=pod-1 (total=1000 used=0 reserved=74 available=926)
+2026/06/17 12:59:57 Reserved budget: requestID=req-# program=program-a pod=pod-1 (total=1000 used=0 reserved=75 available=925)
+2026/06/17 12:59:57 Reserved budget: requestID=req-2 program=program-a pod=pod-1 (total=1000 used=0 reserved=76 available=924)
+2026/06/17 12:59:57 Reserved budget: requestID=req-$ program=program-a pod=pod-1 (total=1000 used=0 reserved=77 available=923)
+2026/06/17 12:59:57 Reserved budget: requestID=req-0 program=program-a pod=pod-1 (total=1000 used=0 reserved=78 available=922)
+2026/06/17 12:59:57 Reserved budget: requestID=req-1 program=program-a pod=pod-1 (total=1000 used=0 reserved=79 available=921)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=80 available=920)
+2026/06/17 12:59:57 Reserved budget: requestID=req-9 program=program-a pod=pod-1 (total=1000 used=0 reserved=81 available=919)
+2026/06/17 12:59:57 Reserved budget: requestID=req-; program=program-a pod=pod-1 (total=1000 used=0 reserved=82 available=918)
+2026/06/17 12:59:57 Reserved budget: requestID=req-7 program=program-a pod=pod-1 (total=1000 used=0 reserved=83 available=917)
+2026/06/17 12:59:57 Reserved budget: requestID=req-8 program=program-a pod=pod-1 (total=1000 used=0 reserved=84 available=916)
+2026/06/17 12:59:57 Reserved budget: requestID=req-: program=program-a pod=pod-1 (total=1000 used=0 reserved=85 available=915)
+2026/06/17 12:59:57 Reserved budget: requestID=req-< program=program-a pod=pod-1 (total=1000 used=0 reserved=86 available=914)
+2026/06/17 12:59:57 Reserved budget: requestID=req-4 program=program-a pod=pod-1 (total=1000 used=0 reserved=87 available=913)
+2026/06/17 12:59:57 Reserved budget: requestID=req-5 program=program-a pod=pod-1 (total=1000 used=0 reserved=88 available=912)
+2026/06/17 12:59:57 Reserved budget: requestID=req-* program=program-a pod=pod-1 (total=1000 used=0 reserved=89 available=911)
+2026/06/17 12:59:57 Reserved budget: requestID=req-& program=program-a pod=pod-1 (total=1000 used=0 reserved=90 available=910)
+2026/06/17 12:59:57 Reserved budget: requestID=req-' program=program-a pod=pod-1 (total=1000 used=0 reserved=91 available=909)
+2026/06/17 12:59:57 Reserved budget: requestID=req-( program=program-a pod=pod-1 (total=1000 used=0 reserved=92 available=908)
+2026/06/17 12:59:57 Reserved budget: requestID=req-) program=program-a pod=pod-1 (total=1000 used=0 reserved=93 available=907)
+2026/06/17 12:59:57 Reserved budget: requestID=req-+ program=program-a pod=pod-1 (total=1000 used=0 reserved=94 available=906)
+2026/06/17 12:59:57 Reserved budget: requestID=req-- program=program-a pod=pod-1 (total=1000 used=0 reserved=95 available=905)
+2026/06/17 12:59:57 Reserved budget: requestID=req-. program=program-a pod=pod-1 (total=1000 used=0 reserved=96 available=904)
+2026/06/17 12:59:57 Reserved budget: requestID=req-% program=program-a pod=pod-1 (total=1000 used=0 reserved=97 available=903)
+2026/06/17 12:59:57 Reserved budget: requestID=req-6 program=program-a pod=pod-1 (total=1000 used=0 reserved=98 available=902)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=99 available=901)
+2026/06/17 12:59:57 Reserved budget: requestID=req-3 program=program-a pod=pod-1 (total=1000 used=0 reserved=100 available=900)
+2026/06/17 12:59:57 BudgetTracker stopped
+--- PASS: TestConcurrentReserve (0.00s)
+2026/06/17 12:59:57 Budget cleanup loop stopped
+=== RUN   TestConcurrentReserveAndRelease
+2026/06/17 12:59:57 BudgetTracker initialized with uniform budget: 1000 requests per program per pod
+2026/06/17 12:59:57 Budget cleanup loop started (interval=1m0s, timeout=5m0s)
+2026/06/17 12:59:57 Auto-created budget map for program: program-a
+2026/06/17 12:59:57 Auto-created budget for program=program-a pod=pod-1 with default=1000 requests
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=1 available=999)
+2026/06/17 12:59:57 Reserved budget: requestID=req-1 program=program-a pod=pod-1 (total=1000 used=0 reserved=2 available=998)
+2026/06/17 12:59:57 Reserved budget: requestID=req-
+ program=program-a pod=pod-1 (total=1000 used=0 reserved=3 available=997)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=4 available=996)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=5 available=995)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=6 available=994)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=7 available=993)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=8 available=992)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=9 available=991)
+2026/06/17 12:59:57 Reserved budget: requestID=req-! program=program-a pod=pod-1 (total=1000 used=0 reserved=10 available=990)
+2026/06/17 12:59:57 Reserved budget: requestID=req-" program=program-a pod=pod-1 (total=1000 used=0 reserved=11 available=989)
+2026/06/17 12:59:57 Reserved budget: requestID=req-# program=program-a pod=pod-1 (total=1000 used=0 reserved=12 available=988)
+2026/06/17 12:59:57 Reserved budget: requestID=req-$ program=program-a pod=pod-1 (total=1000 used=0 reserved=13 available=987)
+2026/06/17 12:59:57 Reserved budget: requestID=req-  program=program-a pod=pod-1 (total=1000 used=0 reserved=14 available=986)
+2026/06/17 12:59:57 Reserved budget: requestID=req-% program=program-a pod=pod-1 (total=1000 used=0 reserved=15 available=985)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=16 available=984)
+2026/06/17 12:59:57 Reserved budget: requestID=req-& program=program-a pod=pod-1 (total=1000 used=0 reserved=17 available=983)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=18 available=982)
+2026/06/17 12:59:57 Reserved budget: requestID=req-' program=program-a pod=pod-1 (total=1000 used=0 reserved=19 available=981)
+2026/06/17 12:59:57 Reserved budget: requestID=req-( program=program-a pod=pod-1 (total=1000 used=0 reserved=20 available=980)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=21 available=979)
+2026/06/17 12:59:57 Reserved budget: requestID=req-) program=program-a pod=pod-1 (total=1000 used=0 reserved=22 available=978)
+2026/06/17 12:59:57 Reserved budget: requestID=req-* program=program-a pod=pod-1 (total=1000 used=0 reserved=23 available=977)
+2026/06/17 12:59:57 Reserved budget: requestID=req-+ program=program-a pod=pod-1 (total=1000 used=0 reserved=24 available=976)
+2026/06/17 12:59:57 Reserved budget: requestID=req-, program=program-a pod=pod-1 (total=1000 used=0 reserved=25 available=975)
+2026/06/17 12:59:57 Reserved budget: requestID=req-- program=program-a pod=pod-1 (total=1000 used=0 reserved=26 available=974)
+2026/06/17 12:59:57 Reserved budget: requestID=req-. program=program-a pod=pod-1 (total=1000 used=0 reserved=27 available=973)
+2026/06/17 12:59:57 Reserved budget: requestID=req-/ program=program-a pod=pod-1 (total=1000 used=0 reserved=28 available=972)
+2026/06/17 12:59:57 Reserved budget: requestID=req-0 program=program-a pod=pod-1 (total=1000 used=0 reserved=29 available=971)
+2026/06/17 12:59:57 Reserved budget: requestID=req-  program=program-a pod=pod-1 (total=1000 used=0 reserved=30 available=970)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=31 available=969)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=32 available=968)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=33 available=967)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=34 available=966)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=35 available=965)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=36 available=964)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=37 available=963)
+2026/06/17 12:59:57 Reserved budget: requestID=req-	 program=program-a pod=pod-1 (total=1000 used=0 reserved=38 available=962)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=39 available=961)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=40 available=960)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=41 available=959)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=42 available=958)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=43 available=957)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=44 available=956)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=45 available=955)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=46 available=954)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=47 available=953)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=48 available=952)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=49 available=951)
+2026/06/17 12:59:57 Reserved budget: requestID=req- program=program-a pod=pod-1 (total=1000 used=0 reserved=50 available=950)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=100.139125ms (total=1000 used=1 reserved=49)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=99.753541ms (total=1000 used=2 reserved=48)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-1 program=program-a pod=pod-1 duration=100.37075ms (total=1000 used=3 reserved=47)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=100.008792ms (total=1000 used=4 reserved=46)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=99.94225ms (total=1000 used=5 reserved=45)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=100.1105ms (total=1000 used=6 reserved=44)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=100.026625ms (total=1000 used=7 reserved=43)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=100.215292ms (total=1000 used=8 reserved=42)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=100.257792ms (total=1000 used=9 reserved=41)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=100.1735ms (total=1000 used=10 reserved=40)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=100.159208ms (total=1000 used=11 reserved=39)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-	 program=program-a pod=pod-1 duration=100.348167ms (total=1000 used=12 reserved=38)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=100.30425ms (total=1000 used=13 reserved=37)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-
+ program=program-a pod=pod-1 duration=100.991875ms (total=1000 used=14 reserved=36)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=100.4125ms (total=1000 used=15 reserved=35)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=101.07325ms (total=1000 used=16 reserved=34)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=100.569ms (total=1000 used=17 reserved=33)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=101.169ms (total=1000 used=18 reserved=32)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=100.581833ms (total=1000 used=19 reserved=31)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=101.257667ms (total=1000 used=20 reserved=30)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=100.73025ms (total=1000 used=21 reserved=29)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=101.338542ms (total=1000 used=22 reserved=28)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=100.804083ms (total=1000 used=23 reserved=27)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=101.420958ms (total=1000 used=24 reserved=26)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-  program=program-a pod=pod-1 duration=101.139625ms (total=1000 used=25 reserved=25)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=101.500625ms (total=1000 used=26 reserved=24)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-! program=program-a pod=pod-1 duration=101.509042ms (total=1000 used=27 reserved=23)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=101.126542ms (total=1000 used=28 reserved=22)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-" program=program-a pod=pod-1 duration=101.588792ms (total=1000 used=29 reserved=21)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=101.298416ms (total=1000 used=30 reserved=20)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-# program=program-a pod=pod-1 duration=101.667167ms (total=1000 used=31 reserved=19)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=101.377333ms (total=1000 used=32 reserved=18)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-$ program=program-a pod=pod-1 duration=101.741083ms (total=1000 used=33 reserved=17)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-% program=program-a pod=pod-1 duration=101.758208ms (total=1000 used=34 reserved=16)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=101.779292ms (total=1000 used=35 reserved=15)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=101.52025ms (total=1000 used=36 reserved=14)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-& program=program-a pod=pod-1 duration=101.818125ms (total=1000 used=37 reserved=13)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-+ program=program-a pod=pod-1 duration=101.760084ms (total=1000 used=38 reserved=12)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-, program=program-a pod=pod-1 duration=101.771166ms (total=1000 used=39 reserved=11)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-  program=program-a pod=pod-1 duration=101.934708ms (total=1000 used=40 reserved=10)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-' program=program-a pod=pod-1 duration=101.907916ms (total=1000 used=41 reserved=9)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-- program=program-a pod=pod-1 duration=101.853458ms (total=1000 used=42 reserved=8)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-( program=program-a pod=pod-1 duration=101.944291ms (total=1000 used=43 reserved=7)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-. program=program-a pod=pod-1 duration=101.88375ms (total=1000 used=44 reserved=6)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-) program=program-a pod=pod-1 duration=101.967667ms (total=1000 used=45 reserved=5)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-/ program=program-a pod=pod-1 duration=101.915625ms (total=1000 used=46 reserved=4)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-* program=program-a pod=pod-1 duration=102.000833ms (total=1000 used=47 reserved=3)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-0 program=program-a pod=pod-1 duration=101.968ms (total=1000 used=48 reserved=2)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=102.125375ms (total=1000 used=49 reserved=1)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req- program=program-a pod=pod-1 duration=102.113792ms (total=1000 used=50 reserved=0)
+2026/06/17 12:59:57 BudgetTracker stopped
+2026/06/17 12:59:57 Budget cleanup loop stopped
+--- PASS: TestConcurrentReserveAndRelease (0.10s)
+=== RUN   TestCleanupStaleReservations
+2026/06/17 12:59:57 BudgetTracker initialized with uniform budget: 100 requests per program per pod
+2026/06/17 12:59:57 Auto-created budget map for program: program-a
+2026/06/17 12:59:57 Auto-created budget for program=program-a pod=pod-1 with default=100 requests
+2026/06/17 12:59:57 Reserved budget: requestID=req-001 program=program-a pod=pod-1 (total=100 used=0 reserved=1 available=99)
+2026/06/17 12:59:57 Budget cleanup loop started (interval=1m0s, timeout=100ms)
+2026/06/17 12:59:57 Cleaned up stale reservation: requestID=req-001 program=program-a pod=pod-1 age=201.074792ms (total=100 used=0 reserved=0)
+2026/06/17 12:59:57 Cleaned up 1 stale reservations (timeout=100ms)
+2026/06/17 12:59:57 BudgetTracker stopped
+--- PASS: TestCleanupStaleReservations (0.20s)
+2026/06/17 12:59:57 Budget cleanup loop stopped
+=== RUN   TestCompleteRequestLifecycle
+2026/06/17 12:59:57 BudgetTracker initialized with uniform budget: 100 requests per program per pod
+2026/06/17 12:59:57 Auto-created budget map for program: program-a
+2026/06/17 12:59:57 Budget cleanup loop started (interval=1m0s, timeout=5m0s)
+2026/06/17 12:59:57 Auto-created budget for program=program-a pod=pod-1 with default=100 requests
+2026/06/17 12:59:57 Reserved budget: requestID=req-001 program=program-a pod=pod-1 (total=100 used=0 reserved=1 available=99)
+2026/06/17 12:59:57 Released and deducted budget: requestID=req-001 program=program-a pod=pod-1 duration=63.25µs (total=100 used=1 reserved=0)
+2026/06/17 12:59:57 BudgetTracker stopped
+--- PASS: TestCompleteRequestLifecycle (0.00s)
+2026/06/17 12:59:57 Budget cleanup loop stopped
+PASS
+ok  	github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/programaware	0.655s

@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: epp-scheduler
+  labels:
+    app: epp-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: epp-scheduler
+  template:
+    metadata:
+      labels:
+        app: epp-scheduler
+    spec:
+      terminationGracePeriodSeconds: 130
+      containers:
+      - name: epp
+        image: epp-scheduler:local
+        imagePullPolicy: Never
+        args:
+        - --endpoint-selector
+        - "app=vllm-d"          # 👈 Targets the selector name from the local vllm-decode component
+        - --endpoint-target-ports
+        - "8000"
+        - --v
+        - "4"
+        - --zap-encoder
+        - "json"
+        - --grpc-port
+        - "9002"
+        - --grpc-health-port
+        - "9003"
+        - --config-file
+        - "/etc/epp/epp-config.yaml"
+        - --metrics-endpoint-auth=false
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        ports:
+        - containerPort: 5557
+        - containerPort: 9002
+        - containerPort: 9003
+        - name: metrics
+          containerPort: 9090
+        volumeMounts:
+        - name: epp-config
+          mountPath: /etc/epp
+        - name: cache
+          mountPath: /cache
+      volumes:
+      - name: epp-config
+        configMap:
+          name: epp-config
+      - name: cache
+        emptyDir: {}

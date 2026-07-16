@@ -271,8 +271,7 @@ func (p *Producer) Produce(ctx context.Context,
 		if md == nil {
 			continue
 		}
-		addr := fmt.Sprintf("%s:%s", md.Address, md.Port)
-		matchLen := int(scores[addr])
+		matchLen := int(scores[md.Address])
 		if matchLen > maxMatch {
 			maxMatch = matchLen
 		}

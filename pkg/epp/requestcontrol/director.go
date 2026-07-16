@@ -513,12 +513,14 @@ func (d *Director) HandleResponseBody(ctx context.Context, reqCtx *handlers.Requ
 
 	startOfStream := !reqCtx.ResponseBodyStarted
 	reqCtx.ResponseBodyStarted = true
+	success := reqCtx.ResponseComplete && reqCtx.ResponseStatusCode == ""
 	response := &fwkrc.Response{
 		RequestID:     reqCtx.Request.Headers[reqcommon.RequestIDHeaderKey],
 		Headers:       reqCtx.Response.Headers,
 		StartOfStream: startOfStream,
 		EndOfStream:   endOfStream,
 		Usage:         reqCtx.Usage,
+		ReqMetadata:   map[string]any{"success": success},
 	}
 	requestID := reqCtx.Request.Headers[reqcommon.RequestIDHeaderKey]
 

@@ -1,0 +1,303 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: inference-gateway
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: inference-gateway
+rules:
+- apiGroups:
+  - inference.networking.x-k8s.io
+  resources:
+  - inferencepools
+  - inferenceobjectives
+  - inferencemodelrewrites
+  verbs:
+  - get
+  - watch
+  - list
+- apiGroups:
+  - inference.networking.k8s.io
+  resources:
+  - inferencepools
+  verbs:
+  - get
+  - watch
+  - list
+- apiGroups:
+  - llm-d.ai
+  resources:
+  - inferenceobjectives
+  - inferencemodelrewrites
+  verbs:
+  - get
+  - watch
+  - list
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - watch
+  - list
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: inference-gateway-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: inference-gateway
+subjects:
+- kind: ServiceAccount
+  name: inference-gateway
+---
+apiVersion: v1
+data:
+  epp-config.yaml: |
+    apiVersion: inference.networking.x-k8s.io/v1alpha1
+    kind: EndpointPickerConfig
+    plugins:
+    - type: token-producer
+      parameters:
+        modelName: Qwen/Qwen2.5-7B-Instruct
+        vllm:
+          url: http://localhost:8082
+    - type: precise-prefix-cache-producer
+      name: precise-prefix-cache-producer
+      parameters:
+        tokenProcessorConfig:
+          blockSize: 16
+        kvEventsConfig:
+          zmqEndpoint: tcp://0.0.0.0:5557
+    - type: program-aware-fairness
+    - type: program-aware-scorer
+      name: program-aware-scorer
+      parameters:
+        prefixMatchInfoProducerName: precise-prefix-cache-producer
+        defaultBudget: 100
+        refreshAmount: 10
+        refreshInterval: "30s"
+        lowUtilThreshold: 0.3
+        mediumUtilThreshold: 0.7
+        lowUtilMultiplier: 1.5
+        mediumUtilMultiplier: 1.0
+        highUtilMultiplier: 0.5
+    - type: max-score-picker
+    - type: single-profile-handler
+
+    featureGates:
+    - flowControl
+
+    flowControl:
+      defaultPriorityBand:
+        fairnessPolicyRef: program-aware-fairness
+
+    schedulingProfiles:
+    - name: default
+      plugins:
+      - pluginRef: program-aware-scorer
+      - pluginRef: max-score-picker
+kind: ConfigMap
+metadata:
+  name: epp-config-g5bg7fcmf6
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: inference-gateway
+  name: inference-gateway
+spec:
+  ports:
+  - appProtocol: http2
+    name: default
+    port: 9002
+    protocol: TCP
+    targetPort: 9002
+  - appProtocol: tcp
+    name: zmq
+    port: 5557
+    protocol: TCP
+    targetPort: 5557
+  - name: metrics
+    port: 9090
+    protocol: TCP
+    targetPort: 9090
+  selector:
+    app: inference-gateway
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: inference-gateway
+  name: inference-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inference-gateway
+  template:
+    metadata:
+      labels:
+        app: inference-gateway
+    spec:
+      containers:
+      - args:
+        - --endpoint-selector
+        - app=vllm-qwen3-32b
+        - --endpoint-target-ports
+        - "8000"
+        - --v
+        - "3"
+        - --zap-encoder
+        - json
+        - --grpc-port
+        - "9002"
+        - --grpc-health-port
+        - "9003"
+        - --config-file
+        - /etc/epp/epp-config.yaml
+        - --metrics-endpoint-auth=false
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        image: epp-scheduler:local
+        imagePullPolicy: Never
+        livenessProbe:
+          grpc:
+            port: 9003
+            service: envoy.service.ext_proc.v3.ExternalProcessor
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        name: epp
+        ports:
+        - containerPort: 5557
+        - containerPort: 9002
+        - containerPort: 9003
+        - containerPort: 9090
+          name: metrics
+        readinessProbe:
+          grpc:
+            port: 9003
+            service: envoy.service.ext_proc.v3.ExternalProcessor
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        volumeMounts:
+        - mountPath: /etc/epp
+          name: epp-config
+        - mountPath: /cache
+          name: cache
+      - args:
+        - Qwen/Qwen2.5-7B-Instruct
+        - --port=8082
+        command:
+        - vllm
+        - launch
+        - render
+        image: vllm/vllm-openai-cpu:v0.19.1
+        imagePullPolicy: IfNotPresent
+        name: vllm-render
+        ports:
+        - containerPort: 8082
+          name: render-http
+        readinessProbe:
+          failureThreshold: 1
+          httpGet:
+            path: /health
+            port: 8082
+          periodSeconds: 5
+          timeoutSeconds: 1
+        startupProbe:
+          failureThreshold: 600
+          httpGet:
+            path: /health
+            port: 8082
+          initialDelaySeconds: 2
+          periodSeconds: 1
+          timeoutSeconds: 1
+        volumeMounts:
+        - mountPath: /root/.cache/huggingface
+          name: model-cache
+      serviceAccountName: inference-gateway
+      terminationGracePeriodSeconds: 130
+      volumes:
+      - configMap:
+          name: epp-config-g5bg7fcmf6
+        name: epp-config
+      - emptyDir: {}
+        name: cache
+      - emptyDir: {}
+        name: model-cache
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: inference-gateway
+spec:
+  gatewayClassName: kgateway
+  listeners:
+  - name: default
+    port: 80
+    protocol: HTTP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  labels:
+    istio.io/rev: llm-d-gateway
+  name: vllm-qwen3-32b-inference-route
+spec:
+  parentRefs:
+  - name: inference-gateway
+  rules:
+  - backendRefs:
+    - group: inference.networking.k8s.io
+      kind: InferencePool
+      name: vllm-qwen3-32b
+      port: 8000
+    matches:
+    - path:
+        type: PathPrefix
+        value: /
+    timeouts:
+      request: 30s
+---
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: vllm-qwen3-32b
+spec:
+  endpointPickerRef:
+    kind: Service
+    name: inference-gateway
+    port:
+      number: 9002
+  selector:
+    matchLabels:
+      app: vllm-qwen3-32b
+  targetPorts: [8000]

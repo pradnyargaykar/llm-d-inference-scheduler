@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${EPP_NAME}
+spec:
+  template:
+    spec:
+      containers:
+      - name: vllm-render
+        args: ["Qwen/Qwen2.5-7B-Instruct", "--port=8082"]
+        ports:
+        - name: render-http
+          containerPort: 8082
+        startupProbe:
+          httpGet:
+            port: 8082
+        readinessProbe:
+          httpGet:
+            port: 8082
+
+# Patch to fix render model name to match vLLM backends (7B instead of 32B)
+
+# Made with Bob
