@@ -360,14 +360,14 @@ func (bt *BudgetTracker) IsFirstTimeProgram(programID string) bool {
 		return true // Never seen this program
 	}
 
-	// Check if any pod has used requests
+	// Check if any pod has used or reserved requests
 	for _, budget := range podBudgets {
-		if budget.UsedRequests > 0 {
-			return false // Program has been used
+		if budget.UsedRequests > 0 || budget.ReservedRequests > 0 {
+			return false // Program has been used or is in-flight
 		}
 	}
 
-	return true // Program exists but never used
+	return true // Program exists but never used or reserved
 }
 
 // RefreshPodBudgets adds budget to all programs on a specific pod with max budget cap

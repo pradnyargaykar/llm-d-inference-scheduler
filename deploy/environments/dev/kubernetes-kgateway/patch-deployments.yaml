@@ -17,7 +17,7 @@ spec:
         - "--pool-group"
         - "inference.networking.x-k8s.io"
         - --v
-        - "4"
+        - "3"
         - --zap-encoder
         - "json"
         - --grpc-port

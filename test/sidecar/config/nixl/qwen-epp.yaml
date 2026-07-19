@@ -20,7 +20,7 @@ spec:
             - --poolNamespace
             - serverless-workstream
             - -v
-            - "4"
+            - "3"
             - --zap-encoder
             - json
             - --grpcPort

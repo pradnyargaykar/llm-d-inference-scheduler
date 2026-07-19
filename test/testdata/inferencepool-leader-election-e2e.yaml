@@ -177,7 +177,7 @@ spec:
         - --pool-namespace
         - "$E2E_NS"
         - --v
-        - "4"
+        - "3"
         - --zap-encoder
         - "json"
         - --grpc-port

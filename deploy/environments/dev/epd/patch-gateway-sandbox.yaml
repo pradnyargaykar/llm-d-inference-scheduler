@@ -16,7 +16,7 @@ spec:
         - --endpoint-target-ports
         - "8000"
         - --v
-        - "4"
+        - "3"
         - --zap-encoder
         - "json"
         - --grpc-port

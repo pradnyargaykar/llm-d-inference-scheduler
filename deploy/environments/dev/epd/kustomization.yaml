@@ -41,7 +41,7 @@ patches:
             - --endpoint-target-ports
             - "8000"
             - --v
-            - "5"
+            - "3"
             - --zap-encoder
             - "json"
             - --grpc-port
