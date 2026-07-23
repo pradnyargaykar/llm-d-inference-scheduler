@@ -398,4 +398,59 @@ func TestCompleteRequestLifecycle(t *testing.T) {
 	assert.Equal(t, 0, tracker.GetInFlightCount())
 }
 
+// TestFirstPodTracking tests the tracking of first pod selected for programs
+func TestFirstPodTracking(t *testing.T) {
+	tracker := NewBudgetTracker(100)
+	defer tracker.Stop()
+
+	// Initial check: no first pod exists for program-a
+	pod, exists := tracker.GetFirstPod("program-a")
+	assert.False(t, exists)
+	assert.Empty(t, pod)
+
+	// Reserve first request on pod-1
+	err := tracker.Reserve("req-001", "program-a", "pod-1")
+	assert.NoError(t, err)
+
+	// Check: first pod should be pod-1
+	pod, exists = tracker.GetFirstPod("program-a")
+	assert.True(t, exists)
+	assert.Equal(t, "pod-1", pod)
+
+	// Reserve another request on pod-2
+	err = tracker.Reserve("req-002", "program-a", "pod-2")
+	assert.NoError(t, err)
+
+	// Check: first pod should STILL be pod-1 (does not overwrite)
+	pod, exists = tracker.GetFirstPod("program-a")
+	assert.True(t, exists)
+	assert.Equal(t, "pod-1", pod)
+
+	// Reset budget for program-a on pod-1
+	err = tracker.ResetBudget("program-a", "pod-1")
+	assert.NoError(t, err)
+
+	// Check: first pod for program-a should be cleared
+	pod, exists = tracker.GetFirstPod("program-a")
+	assert.False(t, exists)
+	assert.Empty(t, pod)
+
+	// Reserve on pod-3
+	err = tracker.Reserve("req-003", "program-a", "pod-3")
+	assert.NoError(t, err)
+
+	// Check: first pod should now be pod-3
+	pod, exists = tracker.GetFirstPod("program-a")
+	assert.True(t, exists)
+	assert.Equal(t, "pod-3", pod)
+
+	// Reset all budgets
+	tracker.ResetAllBudgets()
+
+	// Check: first pod for program-a should be cleared again
+	pod, exists = tracker.GetFirstPod("program-a")
+	assert.False(t, exists)
+	assert.Empty(t, pod)
+}
+
 // Made with Bob

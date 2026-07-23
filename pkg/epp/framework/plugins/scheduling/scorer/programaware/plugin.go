@@ -214,57 +214,91 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 func (p *Plugin) scoreFirstTime(ctx context.Context, programID string, endpoints []scheduling.Endpoint, scores map[scheduling.Endpoint]float64) {
 	logger := log.FromContext(ctx)
 
+	minQueue := int(^uint(0) >> 1) // max int
+	queueSizes := make(map[string]int)
 	for _, endpoint := range endpoints {
 		podID := endpoint.GetMetadata().NamespacedName.String()
+		qSize := 0
+		if metrics := endpoint.GetMetrics(); metrics != nil {
+			qSize = metrics.WaitingQueueSize
+		}
+		queueSizes[podID] = qSize
+		if qSize < minQueue {
+			minQueue = qSize
+		}
+		
+		// Update queue size cache for budget refresher
+		p.budgetRefresher.UpdateQueueSize(podID, qSize)
+	}
 
-		// Get available budget
+	// Hash the programID to get a stable tie-breaker index
+	var hash uint32 = 0
+	for i := 0; i < len(programID); i++ {
+		hash = hash*31 + uint32(programID[i])
+	}
+	hashIndex := int(hash)
+
+	// Identify least loaded endpoints that have available budget
+	var candidateEndpoints []scheduling.Endpoint
+	for _, endpoint := range endpoints {
+		podID := endpoint.GetMetadata().NamespacedName.String()
 		availableBudget := p.budgetTracker.GetAvailable(programID, podID)
 
 		// Always emit budget gauge so it's visible in Prometheus
 		budgetAtScore.WithLabelValues(programID, podID).Set(float64(availableBudget))
 
-		if availableBudget <= 0 {
-			scores[endpoint] = 0.0
-			routingDecisionsTotal.WithLabelValues(programID, podID, "budget_exhausted").Inc()
-			logger.V(logutil.VERBOSE).Info("First-time: No budget available",
-				"endpoint", podID,
-				"programID", programID,
-				"score", 0.0)
-			continue
+		if queueSizes[podID] == minQueue && availableBudget > 0 {
+			candidateEndpoints = append(candidateEndpoints, endpoint)
 		}
+		scores[endpoint] = 0.0
+	}
 
-		// Calculate budget score (0-0.9 range)
-		budgetScore := (float64(availableBudget) / float64(p.budgetTracker.defaultBudget)) * 0.9
+	// Select home pod using programID hash index among least-loaded candidates
+	if len(candidateEndpoints) > 0 {
+		selectedIdx := hashIndex % len(candidateEndpoints)
+		selectedEndpoint := candidateEndpoints[selectedIdx]
+		scores[selectedEndpoint] = 1.0
 
-		// Get KV cache utilization for tie-breaking
-		kvUtilization := p.getKVUtilization(endpoint)
+		selectedPodID := selectedEndpoint.GetMetadata().NamespacedName.String()
+		routingDecisionsTotal.WithLabelValues(programID, selectedPodID, "first_time").Inc()
 
-		// Update utilization cache for budget refresher
-		p.budgetRefresher.UpdateUtilization(podID, kvUtilization)
-
-		// Lower utilization = higher score (tie-breaker, 0-0.1 range)
-		utilizationScore := (1.0 - kvUtilization) * 0.1
-
-		// Final score: budget (0-0.9) + utilization tie-breaker (0-0.1)
-		scores[endpoint] = budgetScore + utilizationScore
-
-		routingDecisionsTotal.WithLabelValues(programID, podID, "first_time").Inc()
-
-		logger.V(logutil.VERBOSE).Info("First-time: Scored endpoint",
-			"endpoint", podID,
+		logger.V(logutil.VERBOSE).Info("First-time: Scored home endpoint",
+			"endpoint", selectedPodID,
 			"programID", programID,
-			"availableBudget", availableBudget,
-			"kvUtilization", kvUtilization,
-			"budgetScore", budgetScore,
-			"utilizationScore", utilizationScore,
-			"finalScore", scores[endpoint])
+			"minQueue", minQueue,
+			"finalScore", 1.0)
+	} else {
+		// Fallback: If no candidate has budget and is at minQueue, fall back to highest budget endpoint
+		var bestEndpoint scheduling.Endpoint
+		maxBudget := int64(-1)
+		for _, endpoint := range endpoints {
+			podID := endpoint.GetMetadata().NamespacedName.String()
+			availableBudget := p.budgetTracker.GetAvailable(programID, podID)
+			if availableBudget > maxBudget {
+				maxBudget = availableBudget
+				bestEndpoint = endpoint
+			}
+		}
+		if bestEndpoint != nil {
+			scores[bestEndpoint] = 1.0
+			selectedPodID := bestEndpoint.GetMetadata().NamespacedName.String()
+			routingDecisionsTotal.WithLabelValues(programID, selectedPodID, "first_time_fallback").Inc()
+
+			logger.V(logutil.VERBOSE).Info("First-time: Fallback to max budget endpoint",
+				"endpoint", selectedPodID,
+				"programID", programID,
+				"availableBudget", maxBudget,
+				"finalScore", 1.0)
+		}
 	}
 }
 
 // scoreSubsequent scores endpoints for subsequent requests
-// Logic: Cache match + budget → Force migration if budget exhausted
+// Logic: prioritizes cacheScore directly, tie-breaks with queue size, and uses soft penalty (0.5x) on budget exhaustion.
 func (p *Plugin) scoreSubsequent(ctx context.Context, programID string, endpoints []scheduling.Endpoint, scores map[scheduling.Endpoint]float64) {
 	logger := log.FromContext(ctx)
+
+	firstPodName, hasFirstPod := p.budgetTracker.GetFirstPod(programID)
 
 	for _, endpoint := range endpoints {
 		podID := endpoint.GetMetadata().NamespacedName.String()
@@ -275,44 +309,50 @@ func (p *Plugin) scoreSubsequent(ctx context.Context, programID string, endpoint
 		// Always emit budget gauge so it's visible in Prometheus
 		budgetAtScore.WithLabelValues(programID, podID).Set(float64(availableBudget))
 
-		// Get KV cache utilization and update cache for refresher
-		kvUtilization := p.getKVUtilization(endpoint)
-		p.budgetRefresher.UpdateUtilization(podID, kvUtilization)
+		// Get replica queue size
+		queueSize := 0
+		metrics := endpoint.GetMetrics()
+		if metrics != nil {
+			queueSize = metrics.WaitingQueueSize
+		}
+		p.budgetRefresher.UpdateQueueSize(podID, queueSize)
 
 		// Get cache score
 		cacheScore := p.getCacheScore(ctx, endpoint)
 
-		if availableBudget > 0 {
-			// Budget available: Prioritize cache match
-			// Cache score (0-1) * 0.9 + budget bonus (0-0.1)
-			budgetBonus := (float64(availableBudget) / float64(p.budgetTracker.defaultBudget)) * 0.1
-			scores[endpoint] = cacheScore*0.9 + budgetBonus
-
-			decisionType := "cache_hit"
-			if cacheScore == 0 {
-				decisionType = "no_cache"
-			}
-			routingDecisionsTotal.WithLabelValues(programID, podID, decisionType).Inc()
-
-			logger.V(logutil.VERBOSE).Info("Subsequent: Budget available",
-				"endpoint", podID,
-				"programID", programID,
-				"availableBudget", availableBudget,
-				"cacheScore", cacheScore,
-				"budgetBonus", budgetBonus,
-				"finalScore", scores[endpoint])
-		} else {
-			// Budget exhausted: Force migration to pod with budget
-			scores[endpoint] = 0.0
-			routingDecisionsTotal.WithLabelValues(programID, podID, "budget_exhausted").Inc()
-			forcedMigrationsTotal.WithLabelValues(programID, podID).Inc()
-
-			logger.V(logutil.VERBOSE).Info("Subsequent: Budget exhausted, forcing migration",
-				"endpoint", podID,
-				"programID", programID,
-				"cacheScore", cacheScore,
-				"finalScore", 0.0)
+		// Base score from cache match + home pod affinity bonus
+		baseScore := cacheScore
+		if cacheScore == 0.0 && hasFirstPod && podID == firstPodName {
+			baseScore += 0.15
 		}
+
+		// Apply soft penalty if budget is exhausted to allow graceful transitions
+		if availableBudget <= 0 {
+			baseScore = baseScore * 0.5
+		}
+
+		// Subtract a tiny queue-based tie-breaker penalty
+		scores[endpoint] = baseScore - float64(queueSize)*0.00001
+
+		decisionType := "cache_hit"
+		if cacheScore == 0 {
+			decisionType = "no_cache"
+		}
+		if availableBudget <= 0 {
+			decisionType = "budget_exhausted"
+			forcedMigrationsTotal.WithLabelValues(programID, podID).Inc()
+		}
+		routingDecisionsTotal.WithLabelValues(programID, podID, decisionType).Inc()
+
+		logger.V(logutil.VERBOSE).Info("Subsequent: Scored endpoint",
+			"endpoint", podID,
+			"programID", programID,
+			"availableBudget", availableBudget,
+			"cacheScore", cacheScore,
+			"hasFirstPod", hasFirstPod,
+			"firstPodName", firstPodName,
+			"queueSize", queueSize,
+			"finalScore", scores[endpoint])
 	}
 }
 

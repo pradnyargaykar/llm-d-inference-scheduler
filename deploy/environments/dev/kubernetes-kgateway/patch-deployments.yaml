@@ -32,3 +32,10 @@ spec:
               secretKeyRef:
                 name: hf-token
                 key: ${HF_SECRET_KEY}
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "512Mi"
+          limits:
+            cpu: "2000m"
+            memory: "1Gi"

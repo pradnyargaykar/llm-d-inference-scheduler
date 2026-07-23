@@ -36,7 +36,10 @@ type BudgetTracker struct {
 	// inFlightRequests tracks requests that have been reserved but not completed
 	inFlightRequests map[string]*InFlightRequest
 
-	// mu protects budgets and inFlightRequests for concurrent access
+	// firstPod maps programID -> podName of the first routed request
+	firstPod map[string]string
+
+	// mu protects budgets, inFlightRequests, and firstPod for concurrent access
 	mu sync.RWMutex
 
 	// Cleanup configuration
@@ -59,6 +62,7 @@ func NewBudgetTracker(defaultBudget int64) *BudgetTracker {
 		budgets:            make(map[string]map[string]*Budget),
 		defaultBudget:      defaultBudget,
 		inFlightRequests:   make(map[string]*InFlightRequest),
+		firstPod:           make(map[string]string),
 		cleanupInterval:    1 * time.Minute,
 		reservationTimeout: 5 * time.Minute,
 		stopCleanup:        make(chan struct{}),
@@ -96,6 +100,12 @@ func (bt *BudgetTracker) Reserve(requestID, programID, podName string) error {
 		}
 		log.Printf("Auto-created budget for program=%s pod=%s with default=%d requests",
 			programID, podName, bt.defaultBudget)
+	}
+
+	// Record the first pod selected for the program if not already set
+	if bt.firstPod[programID] == "" {
+		bt.firstPod[programID] = podName
+		log.Printf("Recorded first pod for program=%s: %s", programID, podName)
 	}
 
 	budget := bt.budgets[programID][podName]
@@ -231,6 +241,7 @@ func (bt *BudgetTracker) ResetBudget(programID, podName string) error {
 	budget.UsedRequests = 0
 	budget.ReservedRequests = 0
 	budget.LastReset = time.Now()
+	delete(bt.firstPod, programID)
 
 	log.Printf("Reset budget for program=%s pod=%s (was: used=%d reserved=%d, now: used=0 reserved=0)",
 		programID, podName, oldUsed, oldReserved)
@@ -242,6 +253,8 @@ func (bt *BudgetTracker) ResetBudget(programID, podName string) error {
 func (bt *BudgetTracker) ResetAllBudgets() {
 	bt.mu.Lock()
 	defer bt.mu.Unlock()
+
+	bt.firstPod = make(map[string]string)
 
 	count := 0
 	for programID, pods := range bt.budgets {
@@ -368,6 +381,14 @@ func (bt *BudgetTracker) IsFirstTimeProgram(programID string) bool {
 	}
 
 	return true // Program exists but never used or reserved
+}
+
+// GetFirstPod returns the name of the pod where the first request was routed
+func (bt *BudgetTracker) GetFirstPod(programID string) (string, bool) {
+	bt.mu.RLock()
+	defer bt.mu.RUnlock()
+	podName, exists := bt.firstPod[programID]
+	return podName, exists
 }
 
 // RefreshPodBudgets adds budget to all programs on a specific pod with max budget cap

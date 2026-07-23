@@ -59,6 +59,13 @@ spec:
           mountPath: /etc/epp
         - name: cache
           mountPath: /cache
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "512Mi"
+          limits:
+            cpu: "2000m"
+            memory: "1Gi"
       # vLLM render sidecar — exposes /v1/completions/render and
       # /v1/chat/completions/render over loopback for the token-producer plugin.
       - name: vllm-render
@@ -87,6 +94,13 @@ spec:
         volumeMounts:
         - name: model-cache
           mountPath: /root/.cache/huggingface
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "1Gi"
+          limits:
+            cpu: "4000m"
+            memory: "4Gi"
       volumes:
       - name: epp-config
         configMap:

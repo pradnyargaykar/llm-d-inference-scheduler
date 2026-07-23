@@ -21,9 +21,9 @@ type BudgetRefresher struct {
 	mediumUtilMultiplier float64
 	highUtilMultiplier   float64
 
-	// Cached utilization data (updated by plugin's Score method)
-	utilizationCache map[string]float64 // podID -> utilization (0.0 to 1.0)
-	cacheMu          sync.RWMutex
+	// Cached queue size data (updated by plugin's Score method)
+	queueSizeCache map[string]int // podID -> waiting queue size
+	cacheMu        sync.RWMutex
 
 	// Control
 	stopChan chan struct{}
@@ -54,17 +54,16 @@ func NewBudgetRefresher(tracker *BudgetTracker, config RefresherConfig) *BudgetR
 		lowUtilMultiplier:    config.LowUtilMultiplier,
 		mediumUtilMultiplier: config.MediumUtilMultiplier,
 		highUtilMultiplier:   config.HighUtilMultiplier,
-		utilizationCache:     make(map[string]float64),
+		queueSizeCache:       make(map[string]int),
 		stopChan:             make(chan struct{}),
 	}
 }
 
-// UpdateUtilization updates the cached utilization for a pod
-// This should be called by the plugin's Score method
-func (r *BudgetRefresher) UpdateUtilization(podID string, utilization float64) {
+// UpdateQueueSize updates the cached waiting queue size for a pod
+func (r *BudgetRefresher) UpdateQueueSize(podID string, queueSize int) {
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
-	r.utilizationCache[podID] = utilization
+	r.queueSizeCache[podID] = queueSize
 }
 
 // Start begins the periodic budget refresh loop
@@ -131,35 +130,35 @@ func (r *BudgetRefresher) performRefresh(ctx context.Context) {
 	logger := log.FromContext(ctx)
 	startTime := time.Now()
 
-	// Get cached utilization data (updated by plugin's Score method)
+	// Get cached queue size data (updated by plugin's Score method)
 	r.cacheMu.RLock()
-	utilizationSnapshot := make(map[string]float64, len(r.utilizationCache))
-	for podID, util := range r.utilizationCache {
-		utilizationSnapshot[podID] = util
+	queueSizeSnapshot := make(map[string]int, len(r.queueSizeCache))
+	for podID, qSize := range r.queueSizeCache {
+		queueSizeSnapshot[podID] = qSize
 	}
 	r.cacheMu.RUnlock()
 
-	if len(utilizationSnapshot) == 0 {
-		logger.Info("[BudgetRefresher] No utilization data cached, skipping refresh")
+	if len(queueSizeSnapshot) == 0 {
+		logger.Info("[BudgetRefresher] No queue size data cached, skipping refresh")
 		return
 	}
 
-	// Calculate and apply refresh amounts per pod based on utilization
-	var lowUtilCount, mediumUtilCount, highUtilCount int
+	// Calculate and apply refresh amounts per pod based on replica queue size
+	var lowQueueCount, mediumQueueCount, highQueueCount int
 	refreshedPods := 0
 
-	for podID, utilization := range utilizationSnapshot {
-		// Determine refresh multiplier based on utilization
+	for podID, queueSize := range queueSizeSnapshot {
+		// Determine refresh multiplier based on replica waiting queue size
 		var multiplier float64
-		if utilization < r.lowUtilThreshold {
+		if queueSize <= 1 {
 			multiplier = r.lowUtilMultiplier
-			lowUtilCount++
-		} else if utilization < r.mediumUtilThreshold {
+			lowQueueCount++
+		} else if queueSize <= 3 {
 			multiplier = r.mediumUtilMultiplier
-			mediumUtilCount++
+			mediumQueueCount++
 		} else {
 			multiplier = r.highUtilMultiplier
-			highUtilCount++
+			highQueueCount++
 		}
 
 		refreshAmount := int64(float64(r.refreshAmount) * multiplier)
@@ -168,22 +167,22 @@ func (r *BudgetRefresher) performRefresh(ctx context.Context) {
 		r.budgetTracker.RefreshPodBudgets(podID, refreshAmount)
 		refreshedPods++
 
-		logger.V(2).Info("[BudgetRefresher] Pod refresh applied",
+		logger.V(2).Info("[BudgetRefresher] Pod refresh applied based on queue size",
 			"pod", podID,
-			"utilization", utilization,
+			"queueSize", queueSize,
 			"multiplier", multiplier,
 			"refreshAmount", refreshAmount,
 			"maxBudget", r.budgetTracker.defaultBudget)
 	}
 
 	duration := time.Since(startTime)
-	logger.Info("[BudgetRefresher] Refresh completed",
+	logger.Info("[BudgetRefresher] Refresh completed based on queue size",
 		"duration", duration,
 		"refreshedPods", refreshedPods,
-		"numPods", len(utilizationSnapshot),
-		"lowUtilPods", lowUtilCount,
-		"mediumUtilPods", mediumUtilCount,
-		"highUtilPods", highUtilCount)
+		"numPods", len(queueSizeSnapshot),
+		"lowQueuePods", lowQueueCount,
+		"mediumQueuePods", mediumQueueCount,
+		"highQueuePods", highQueueCount)
 }
 
 // GetStatus returns the current status of the refresher
