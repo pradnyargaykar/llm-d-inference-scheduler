@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -21,11 +22,20 @@ const (
 	// ProgramAwareScorerPluginType is the exported type name for registration
 	ProgramAwareScorerPluginType = ProgramAwareType
 	ProgramAwareType             = "program-aware-scorer"
+
+	defaultMissThreshold = 3
+	defaultMaxContext    = 32768
 )
 
 // Config defines the configuration for the program-aware scorer plugin
 type Config struct {
-	// Old budget parameters retained for compatibility with old configs
+	// PrefixMatchInfoProducerName is the name of the data producer that produces PrefixCacheMatchInfo
+	PrefixMatchInfoProducerName string `json:"prefixMatchInfoProducerName,omitempty"`
+
+	// MissThreshold for pin migration
+	MissThreshold int `json:"missThreshold,omitempty"`
+
+	// Retained for backward compatibility with existing YAML configs
 	DefaultBudget        int64   `json:"defaultBudget,omitempty"`
 	RefreshAmount        int64   `json:"refreshAmount,omitempty"`
 	RefreshInterval      string  `json:"refreshInterval,omitempty"`
@@ -34,11 +44,6 @@ type Config struct {
 	LowUtilMultiplier    float64 `json:"lowUtilMultiplier,omitempty"`
 	MediumUtilMultiplier float64 `json:"mediumUtilMultiplier,omitempty"`
 	HighUtilMultiplier   float64 `json:"highUtilMultiplier,omitempty"`
-
-	// PrefixMatchInfoProducerName is the name of the data producer that produces PrefixCacheMatchInfo
-	PrefixMatchInfoProducerName string `json:"prefixMatchInfoProducerName,omitempty"`
-
-	// Unified cost-based coefficients
 	LoadCoefficient      float64 `json:"loadCoefficient,omitempty"`
 	KvCoefficient        float64 `json:"kvCoefficient,omitempty"`
 	RecomputeCoefficient float64 `json:"recomputeCoefficient,omitempty"`
@@ -53,10 +58,12 @@ type Plugin struct {
 	programTokens map[string]int64
 	tokensMu      sync.RWMutex
 
-	loadCoefficient      float64
-	kvCoefficient        float64
-	recomputeCoefficient float64
-	queueThreshold       float64
+	mu            sync.RWMutex
+	pins          map[string]string
+	podCount      map[string]int
+	misses        map[string]int
+	rrCursor      int
+	missThreshold int
 }
 
 // compile-time type assertions
@@ -88,70 +95,40 @@ var ProgramAwareScorerPluginFactory = Factory
 
 // New creates a new program-aware scorer
 func New(ctx context.Context, name string, cfg Config) *Plugin {
-	logger := log.FromContext(ctx)
-
-	// Set defaults
-	if cfg.LoadCoefficient <= 0 {
-		cfg.LoadCoefficient = 0.1
+	missThreshold := defaultMissThreshold
+	if cfg.MissThreshold > 0 {
+		missThreshold = cfg.MissThreshold
 	}
-	if cfg.KvCoefficient <= 0 {
-		cfg.KvCoefficient = 0.5
-	}
-	if cfg.RecomputeCoefficient <= 0 {
-		cfg.RecomputeCoefficient = 0.0001
-	}
-	if cfg.QueueThreshold <= 0 {
-		cfg.QueueThreshold = 100.0
-	}
-
-	logger.V(logutil.DEFAULT).Info("Program-aware scorer initialized",
-		"loadCoefficient", cfg.LoadCoefficient,
-		"kvCoefficient", cfg.KvCoefficient,
-		"recomputeCoefficient", cfg.RecomputeCoefficient,
-		"queueThreshold", cfg.QueueThreshold)
 
 	return &Plugin{
-		typedName: plugin.TypedName{
-			Type: ProgramAwareType,
-			Name: name,
-		},
-		prefixMatchDataKey:   attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(cfg.PrefixMatchInfoProducerName),
-		programTokens:        make(map[string]int64),
-		loadCoefficient:      cfg.LoadCoefficient,
-		kvCoefficient:        cfg.KvCoefficient,
-		recomputeCoefficient: cfg.RecomputeCoefficient,
-		queueThreshold:       cfg.QueueThreshold,
+		typedName:          plugin.TypedName{Type: ProgramAwareType, Name: name},
+		prefixMatchDataKey: attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(cfg.PrefixMatchInfoProducerName),
+		programTokens:      make(map[string]int64),
+		pins:               make(map[string]string),
+		podCount:           make(map[string]int),
+		misses:             make(map[string]int),
+		missThreshold:      missThreshold,
 	}
 }
 
-// TypedName returns the typed name of the plugin
+// TypedName returns the type and name tuple of this plugin instance
 func (p *Plugin) TypedName() plugin.TypedName {
 	return p.typedName
 }
 
-// Category returns the preference the scorer applies when scoring candidate endpoints
+// Category returns the preference the scorer applies
 func (p *Plugin) Category() scheduling.ScorerCategory {
 	return scheduling.Affinity
 }
 
-// Produces returns the data produced by the plugin
-func (p *Plugin) Produces() map[plugin.DataKey]any {
-	return map[plugin.DataKey]any{}
-}
-
-// Consumes returns the data consumed by the plugin
-func (p *Plugin) Consumes() plugin.DataDependencies {
-	return plugin.DataDependencies{
-		Optional: map[plugin.DataKey]any{p.prefixMatchDataKey: attrprefix.PrefixCacheMatchInfo{}},
-	}
-}
-
-// Score scores the given endpoints based on load, KV utilization, and recomputation cost
+// Score computes a model-agnostic, zero-tuning relative score for candidate endpoints.
 func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, endpoints []scheduling.Endpoint) map[scheduling.Endpoint]float64 {
 	logger := log.FromContext(ctx)
 	scores := make(map[scheduling.Endpoint]float64, len(endpoints))
+	if len(endpoints) == 0 {
+		return scores
+	}
 
-	// Extract program ID from request
 	programID := req.FairnessID
 	if programID == "" {
 		programID = metadata.DefaultFairnessID
@@ -161,93 +138,194 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 	tokensSoFar := p.programTokens[programID]
 	p.tokensMu.RUnlock()
 
-	logger.V(logutil.VERBOSE).Info("Scoring endpoints",
-		"programID", programID,
-		"tokensSoFar", tokensSoFar,
-		"numEndpoints", len(endpoints))
+	p.mu.RLock()
+	pinnedKey := p.pins[programID]
+	p.mu.RUnlock()
+
+	// Min-Max queue normalization across candidate endpoints
+	minQueue := -1.0
+	maxQueue := 0.0
+	for _, ep := range endpoints {
+		m := ep.GetMetrics()
+		q := 0.0
+		if m != nil {
+			q = float64(m.WaitingQueueSize)
+		}
+		if minQueue < 0 || q < minQueue {
+			minQueue = q
+		}
+		if q > maxQueue {
+			maxQueue = q
+		}
+	}
+	queueRange := maxQueue - minQueue + 1.0
+
+	// Bounded prompt context fraction (0.0 to 1.0)
+	promptFraction := float64(tokensSoFar) / float64(defaultMaxContext)
+	if promptFraction > 1.0 {
+		promptFraction = 1.0
+	}
 
 	for _, endpoint := range endpoints {
 		podID := endpoint.GetMetadata().NamespacedName.String()
 
-		metrics := endpoint.GetMetrics()
-		load := 0.0
-		kvUtil := 0.0
-		if metrics != nil {
-			load = float64(metrics.WaitingQueueSize)
-			kvUtil = metrics.KVCacheUsagePercent
-		}
-
-		// Calculate load/util penalty
-		loadTerm := 1.0 - (load / p.queueThreshold)
-		if loadTerm < 0 {
-			loadTerm = 0
-		}
-		penalty := p.loadCoefficient*load + p.kvCoefficient*kvUtil
-
-		// Get cache score (hit ratio 0.0 to 1.0)
+		// 1. Prefix Cache Match Ratio (0.0 to 1.0)
 		cacheScore := p.getCacheScore(ctx, endpoint)
 
-		// Calculate recompute cost for missing part of the program KV cache
-		recomputeCost := (1.0 - cacheScore) * float64(tokensSoFar) * p.recomputeCoefficient
+		// 2. Pin Affinity Boost (1.0 if pinned, 0.0 otherwise)
+		pinBoost := 0.0
+		if pinnedKey != "" && podID == pinnedKey {
+			pinBoost = 1.0
+		}
 
-		// Final score
-		score := 1.0 - penalty - recomputeCost
+		// 3. Relative Queue Load (0.0 to 1.0)
+		metrics := endpoint.GetMetrics()
+		queueSize := 0.0
+		kvUtil := 0.0
+		if metrics != nil {
+			queueSize = float64(metrics.WaitingQueueSize)
+			kvUtil = metrics.KVCacheUsagePercent
+		}
+		relLoad := (queueSize - minQueue) / queueRange
+
+		// 4. Steep KV Memory Saturation Guard (-0.8 if KV >= 80%)
+		kvGuard := 0.0
+		if kvUtil >= 0.80 {
+			kvGuard = 0.8
+		}
+
+		// Final Relative Score (Zero Magic Coefficients)
+		// Score = (HitRatio + PinBoost) - (CacheMiss * PromptFraction * RelativeLoad) - KVGuard
+		score := (cacheScore + pinBoost) - ((1.0 - cacheScore) * promptFraction * relLoad) - kvGuard
 		scores[endpoint] = score
 
-		// Record prometheus metric for visibility
+		// Record prometheus metric for observability
 		budgetAtScore.WithLabelValues(programID, podID).Set(score)
 
 		decisionType := "cache_miss"
 		if cacheScore > 0 {
-			isSaturated := kvUtil >= 0.85 || load >= 3.0
-			if isSaturated {
-				if float64(tokensSoFar)*p.recomputeCoefficient >= penalty {
-					decisionType = "cache_hit_saturated_wait"
-				} else {
-					decisionType = "cache_hit_saturated_migrate"
-					forcedMigrationsTotal.WithLabelValues(programID, podID).Inc()
-				}
+			if kvUtil >= 0.80 || relLoad >= 0.75 {
+				decisionType = "cache_hit_saturated_migrate"
+				forcedMigrationsTotal.WithLabelValues(programID, podID).Inc()
 			} else {
 				decisionType = "cache_hit"
 			}
 		}
 		routingDecisionsTotal.WithLabelValues(programID, podID, decisionType).Inc()
 
-		logger.V(logutil.VERBOSE).Info("Scored endpoint",
+		logger.V(logutil.VERBOSE).Info("Scored endpoint relative",
 			"endpoint", podID,
 			"programID", programID,
-			"load", load,
-			"kvUtil", kvUtil,
 			"cacheScore", cacheScore,
-			"penalty", penalty,
-			"recomputeCost", recomputeCost,
+			"pinBoost", pinBoost,
+			"relLoad", relLoad,
+			"promptFraction", promptFraction,
+			"kvGuard", kvGuard,
 			"finalScore", score)
 	}
 
 	return scores
 }
 
-// getCacheScore retrieves the cache score from the endpoint data
-func (p *Plugin) getCacheScore(ctx context.Context, endpoint scheduling.Endpoint) float64 {
+// leastLoadedPod returns the candidate pod pinned by the fewest programs.
+func (p *Plugin) leastLoadedPod(endpoints []scheduling.Endpoint) scheduling.Endpoint {
+	keys := make([]string, len(endpoints))
+	byKey := make(map[string]scheduling.Endpoint, len(endpoints))
+	for i, ep := range endpoints {
+		k := ep.GetMetadata().NamespacedName.String()
+		keys[i] = k
+		byKey[k] = ep
+	}
+	sort.Strings(keys)
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	minCount := -1
+	candidates := make([]string, 0, len(keys))
+	for _, k := range keys {
+		c := p.podCount[k]
+		switch {
+		case minCount == -1 || c < minCount:
+			minCount = c
+			candidates = append(candidates[:0], k)
+		case c == minCount:
+			candidates = append(candidates, k)
+		}
+	}
+	return byKey[candidates[p.rrCursor%len(candidates)]]
+}
+
+// PreRequest tracks pin commitments and token usage.
+func (p *Plugin) PreRequest(ctx context.Context, req *scheduling.InferenceRequest, result *scheduling.SchedulingResult) {
+	if result == nil {
+		return
+	}
+
+	chosen, ok := chosenPod(result)
+	if !ok {
+		return
+	}
+
+	programID := req.FairnessID
+	if programID == "" {
+		programID = metadata.DefaultFairnessID
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.rrCursor++
+
+	existing, pinned := p.pins[programID]
+	switch {
+	case !pinned:
+		p.pins[programID] = chosen
+		p.podCount[chosen]++
+		delete(p.misses, programID)
+	case existing == chosen:
+		delete(p.misses, programID)
+	default:
+		p.misses[programID]++
+		if p.misses[programID] >= p.missThreshold {
+			p.podCount[existing]--
+			if p.podCount[existing] <= 0 {
+				delete(p.podCount, existing)
+			}
+			p.pins[programID] = chosen
+			p.podCount[chosen]++
+			delete(p.misses, programID)
+		}
+	}
+}
+
+// ResponseBody processes token counts from response stream.
+func (p *Plugin) ResponseBody(ctx context.Context, req *scheduling.InferenceRequest, resp *requestcontrol.Response, targetEndpoint *datalayer.EndpointMetadata) {
+	if !resp.EndOfStream {
+		return
+	}
+
+	programID := req.FairnessID
+	if programID == "" {
+		programID = metadata.DefaultFairnessID
+	}
+
+	promptTokens := int64(resp.Usage.PromptTokens)
+	completionTokens := int64(resp.Usage.CompletionTokens)
+	totalTokens := promptTokens + completionTokens
+
+	p.tokensMu.Lock()
+	if totalTokens > 0 {
+		p.programTokens[programID] += totalTokens
+	}
+	totalTokensSoFar := p.programTokens[programID]
+	p.tokensMu.Unlock()
+
 	logger := log.FromContext(ctx)
-
-	info, ok := endpoint.Get(p.prefixMatchDataKey.String())
-	if !ok {
-		return 0.0
-	}
-
-	prefixMatchInfo, ok := info.(*attrprefix.PrefixCacheMatchInfo)
-	if !ok {
-		logger.V(logutil.DEFAULT).Error(nil, "PrefixCacheMatchInfo has unexpected type",
-			"endpoint", endpoint.GetMetadata().NamespacedName.String())
-		return 0.0
-	}
-
-	if prefixMatchInfo.TotalBlocks() == 0 {
-		return 0.0
-	}
-
-	return float64(prefixMatchInfo.MatchBlocks()) / float64(prefixMatchInfo.TotalBlocks())
+	logger.V(logutil.VERBOSE).Info("ResponseBody: updated program tokens",
+		"programID", programID,
+		"promptTokens", promptTokens,
+		"completionTokens", completionTokens,
+		"totalTokensSoFar", totalTokensSoFar)
 }
 
 // GetProgramTokens returns the accumulated tokens for a program ID (used for testing)
@@ -264,42 +342,29 @@ func (p *Plugin) SetProgramTokens(programID string, tokens int64) {
 	p.programTokens[programID] = tokens
 }
 
-// PreRequest is a no-op since budget reservation is no longer needed
-func (p *Plugin) PreRequest(ctx context.Context, req *scheduling.InferenceRequest, result *scheduling.SchedulingResult) {
+// getCacheScore retrieves the cache hit score (0.0 to 1.0)
+func (p *Plugin) getCacheScore(ctx context.Context, endpoint scheduling.Endpoint) float64 {
+	info, ok := endpoint.Get(p.prefixMatchDataKey.String())
+	if !ok {
+		return 0.0
+	}
+
+	prefixMatchInfo, ok := info.(*attrprefix.PrefixCacheMatchInfo)
+	if !ok || prefixMatchInfo.TotalBlocks() == 0 {
+		return 0.0
+	}
+
+	return float64(prefixMatchInfo.MatchBlocks()) / float64(prefixMatchInfo.TotalBlocks())
 }
 
-// ResponseBody processes the response body after request completion.
-// Accumulates the token usage processed by this program ID so far.
-func (p *Plugin) ResponseBody(ctx context.Context, req *scheduling.InferenceRequest, resp *requestcontrol.Response, targetEndpoint *datalayer.EndpointMetadata) {
-	if !resp.EndOfStream {
-		return
+// chosenPod extracts the pod selected by the picker
+func chosenPod(result *scheduling.SchedulingResult) (string, bool) {
+	if result == nil {
+		return "", false
 	}
-
-	programID := req.FairnessID
-	if programID == "" {
-		programID = metadata.DefaultFairnessID
+	profile, ok := result.ProfileResults[result.PrimaryProfileName]
+	if !ok || profile == nil || len(profile.TargetEndpoints) == 0 {
+		return "", false
 	}
-
-	promptTokens := int64(resp.Usage.PromptTokens)
-	completionTokens := int64(resp.Usage.CompletionTokens)
-	totalTokens := promptTokens + completionTokens
-
-	var totalTokensSoFar int64
-	p.tokensMu.Lock()
-	if totalTokens > 0 {
-		p.programTokens[programID] += totalTokens
-	}
-	totalTokensSoFar = p.programTokens[programID]
-	p.tokensMu.Unlock()
-
-	logger := log.FromContext(ctx)
-	logger.V(logutil.VERBOSE).Info("ResponseBody: updated program tokens",
-		"programID", programID,
-		"promptTokens", promptTokens,
-		"completionTokens", completionTokens,
-		"totalTokensSoFar", totalTokensSoFar)
-}
-
-// Stop is a no-op
-func (p *Plugin) Stop() {
+	return profile.TargetEndpoints[0].GetMetadata().NamespacedName.String(), true
 }

@@ -18,19 +18,19 @@ func TestProgramAwareScorer(t *testing.T) {
 	producerName := "test-producer"
 	matchKey := attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(producerName).String()
 
-	// Pod A: Cache hit, but saturated/loaded (load = 5, kvUtil = 0.9)
+	// Pod A: Cache hit, moderate load (load = 2, kvUtil = 0.5)
 	attrA := fwkdl.NewAttributes()
 	attrA.Put(matchKey, attrprefix.NewPrefixCacheMatchInfo(10, 10, 16)) // 100% cache hit
 	endpointA := scheduling.NewEndpoint(
 		&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod-a"}},
 		&fwkdl.Metrics{
-			WaitingQueueSize:    5,
-			KVCacheUsagePercent: 0.9,
+			WaitingQueueSize:    2,
+			KVCacheUsagePercent: 0.5,
 		},
 		attrA,
 	)
 
-	// Pod B: Cache miss, completely idle/low load (load = 0, kvUtil = 0.1)
+	// Pod B: Cache miss, completely idle (load = 0, kvUtil = 0.1)
 	endpointB := scheduling.NewEndpoint(
 		&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod-b"}},
 		&fwkdl.Metrics{
@@ -43,17 +43,17 @@ func TestProgramAwareScorer(t *testing.T) {
 	tests := []struct {
 		name         string
 		tokensSoFar  int64
-		wantSelected string // Which pod should have the higher score
+		wantSelected string
 	}{
 		{
-			name:         "Small program: migrate to idle cache-miss pod B",
+			name:         "Program stays on cache-hit pod A when memory is healthy",
 			tokensSoFar:  1000,
-			wantSelected: "pod-b", // Migrate! Because recomputing 1000 tokens is cheaper than waiting behind 5 queued requests on pod-a
+			wantSelected: "pod-a",
 		},
 		{
-			name:         "Large program: stay/wait on cache-hit pod A",
+			name:         "Large program stays on cache-hit pod A",
 			tokensSoFar:  12000,
-			wantSelected: "pod-a", // Stay! Because recomputing 12000 tokens is more expensive than waiting on pod-a
+			wantSelected: "pod-a",
 		},
 	}
 
@@ -61,15 +61,10 @@ func TestProgramAwareScorer(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := programaware.Config{
 				PrefixMatchInfoProducerName: producerName,
-				LoadCoefficient:             0.1,
-				KvCoefficient:               0.5,
-				RecomputeCoefficient:        0.0001,
-				QueueThreshold:              100.0,
 			}
 			ctx := context.Background()
 			p := programaware.New(ctx, "test-scorer", cfg)
 
-			// Set program tokens
 			p.SetProgramTokens("program-1", tc.tokensSoFar)
 
 			req := &scheduling.InferenceRequest{
@@ -81,7 +76,7 @@ func TestProgramAwareScorer(t *testing.T) {
 			scoreA := scores[endpointA]
 			scoreB := scores[endpointB]
 
-			t.Logf("Tokens: %d, Score A (hit, loaded): %f, Score B (miss, idle): %f", tc.tokensSoFar, scoreA, scoreB)
+			t.Logf("Tokens: %d, Score A (hit): %f, Score B (miss): %f", tc.tokensSoFar, scoreA, scoreB)
 
 			var gotSelected string
 			if scoreA > scoreB {
@@ -116,13 +111,11 @@ func TestResponseBodyTokenAccumulation(t *testing.T) {
 		Usage:       requesthandling.Usage{PromptTokens: 100, CompletionTokens: 100},
 	}
 
-	// Process first request completion
 	p.ResponseBody(ctx, req, resp1, nil)
 	if tokens := p.GetProgramTokens("program-1"); tokens != 200 {
 		t.Errorf("Expected 200 tokens accumulated, got %d", tokens)
 	}
 
-	// Process second request completion
 	p.ResponseBody(ctx, req, resp2, nil)
 	if tokens := p.GetProgramTokens("program-1"); tokens != 400 {
 		t.Errorf("Expected 400 tokens accumulated, got %d", tokens)
