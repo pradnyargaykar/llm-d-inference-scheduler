@@ -55,8 +55,9 @@ type Plugin struct {
 	typedName          plugin.TypedName
 	prefixMatchDataKey plugin.DataKey
 
-	programTokens map[string]int64
-	tokensMu      sync.RWMutex
+	programTokens   map[string]int64
+	maxActiveTokens int64
+	tokensMu        sync.RWMutex
 
 	mu            sync.RWMutex
 	pins          map[string]string
@@ -104,6 +105,7 @@ func New(ctx context.Context, name string, cfg Config) *Plugin {
 		typedName:          plugin.TypedName{Type: ProgramAwareType, Name: name},
 		prefixMatchDataKey: attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(cfg.PrefixMatchInfoProducerName),
 		programTokens:      make(map[string]int64),
+		maxActiveTokens:    1000,
 		pins:               make(map[string]string),
 		podCount:           make(map[string]int),
 		misses:             make(map[string]int),
@@ -121,7 +123,8 @@ func (p *Plugin) Category() scheduling.ScorerCategory {
 	return scheduling.Affinity
 }
 
-// Score computes a model-agnostic, zero-tuning relative score for candidate endpoints.
+// Score computes a clean model-agnostic, zero-tuning 2-penalty score for candidate endpoints.
+// Formula: Score_i = CacheScore + PinBoost - RelLoad - RecomputePenalty
 func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, endpoints []scheduling.Endpoint) map[scheduling.Endpoint]float64 {
 	logger := log.FromContext(ctx)
 	scores := make(map[scheduling.Endpoint]float64, len(endpoints))
@@ -136,13 +139,14 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 
 	p.tokensMu.RLock()
 	tokensSoFar := p.programTokens[programID]
+	maxActive := p.maxActiveTokens
 	p.tokensMu.RUnlock()
 
 	p.mu.RLock()
 	pinnedKey := p.pins[programID]
 	p.mu.RUnlock()
 
-	// Min-Max queue normalization across candidate endpoints
+	// 1. Relative Queue Load Normalization across candidate endpoints
 	minQueue := -1.0
 	maxQueue := 0.0
 	for _, ep := range endpoints {
@@ -158,53 +162,54 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 			maxQueue = q
 		}
 	}
-	queueRange := maxQueue - minQueue + 1.0
+	queueDiff := maxQueue - minQueue
+	if queueDiff < 1.0 {
+		queueDiff = 1.0
+	}
 
-	// Bounded prompt context fraction (0.0 to 1.0)
-	promptFraction := float64(tokensSoFar) / float64(defaultMaxContext)
-	if promptFraction > 1.0 {
-		promptFraction = 1.0
+	// 2. Relative KV Context Ratio (0.0 to 1.0) dynamically scaled by Max Workload KV
+	if maxActive < 1000 {
+		maxActive = 1000
+	}
+	contextRatio := float64(tokensSoFar) / float64(maxActive)
+	if contextRatio > 1.0 {
+		contextRatio = 1.0
 	}
 
 	for _, endpoint := range endpoints {
 		podID := endpoint.GetMetadata().NamespacedName.String()
 
-		// 1. Prefix Cache Match Ratio (0.0 to 1.0)
+		// Prefix Cache Match Ratio (0.0 to 1.0)
 		cacheScore := p.getCacheScore(ctx, endpoint)
 
-		// 2. Pin Affinity Boost (1.0 if pinned, 0.0 otherwise)
+		// Pin Affinity Boost (+1.0 if home pod, 0.0 otherwise)
 		pinBoost := 0.0
 		if pinnedKey != "" && podID == pinnedKey {
 			pinBoost = 1.0
 		}
 
-		// 3. Relative Queue Load (0.0 to 1.0)
+		// Relative Queue Load Penalty (0.0 to 1.0)
 		metrics := endpoint.GetMetrics()
 		queueSize := 0.0
-		kvUtil := 0.0
 		if metrics != nil {
 			queueSize = float64(metrics.WaitingQueueSize)
-			kvUtil = metrics.KVCacheUsagePercent
 		}
-		relLoad := (queueSize - minQueue) / queueRange
+		relLoad := (queueSize - minQueue) / queueDiff
 
-		// 4. Steep KV Memory Saturation Guard (-0.8 if KV >= 80%)
-		kvGuard := 0.0
-		if kvUtil >= 0.80 {
-			kvGuard = 0.8
-		}
+		// Physical KV Cache Recompute Penalty (0.0 to 1.0)
+		recomputePenalty := (1.0 - cacheScore) * contextRatio
 
-		// Final Relative Score (Zero Magic Coefficients)
-		// Score = (HitRatio + PinBoost) - (CacheMiss * PromptFraction * RelativeLoad) - KVGuard
-		score := (cacheScore + pinBoost) - ((1.0 - cacheScore) * promptFraction * relLoad) - kvGuard
+		// Clean 2-Penalty Formula:
+		// Score = CacheScore + PinBoost - RelLoad - RecomputePenalty
+		score := cacheScore + pinBoost - relLoad - recomputePenalty
 		scores[endpoint] = score
 
-		// Record prometheus metric for observability
+		// Record metrics for observability
 		budgetAtScore.WithLabelValues(programID, podID).Set(score)
 
 		decisionType := "cache_miss"
 		if cacheScore > 0 {
-			if kvUtil >= 0.80 || relLoad >= 0.75 {
+			if relLoad >= 0.75 {
 				decisionType = "cache_hit_saturated_migrate"
 				forcedMigrationsTotal.WithLabelValues(programID, podID).Inc()
 			} else {
@@ -213,14 +218,14 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 		}
 		routingDecisionsTotal.WithLabelValues(programID, podID, decisionType).Inc()
 
-		logger.V(logutil.VERBOSE).Info("Scored endpoint relative",
+		logger.V(logutil.VERBOSE).Info("Scored endpoint 2-penalty",
 			"endpoint", podID,
 			"programID", programID,
 			"cacheScore", cacheScore,
 			"pinBoost", pinBoost,
 			"relLoad", relLoad,
-			"promptFraction", promptFraction,
-			"kvGuard", kvGuard,
+			"recomputePenalty", recomputePenalty,
+			"contextRatio", contextRatio,
 			"finalScore", score)
 	}
 
@@ -318,6 +323,9 @@ func (p *Plugin) ResponseBody(ctx context.Context, req *scheduling.InferenceRequ
 		p.programTokens[programID] += totalTokens
 	}
 	totalTokensSoFar := p.programTokens[programID]
+	if totalTokensSoFar > p.maxActiveTokens {
+		p.maxActiveTokens = totalTokensSoFar
+	}
 	p.tokensMu.Unlock()
 
 	logger := log.FromContext(ctx)
@@ -325,7 +333,8 @@ func (p *Plugin) ResponseBody(ctx context.Context, req *scheduling.InferenceRequ
 		"programID", programID,
 		"promptTokens", promptTokens,
 		"completionTokens", completionTokens,
-		"totalTokensSoFar", totalTokensSoFar)
+		"totalTokensSoFar", totalTokensSoFar,
+		"maxActiveTokens", p.maxActiveTokens)
 }
 
 // GetProgramTokens returns the accumulated tokens for a program ID (used for testing)
@@ -340,6 +349,9 @@ func (p *Plugin) SetProgramTokens(programID string, tokens int64) {
 	p.tokensMu.Lock()
 	defer p.tokensMu.Unlock()
 	p.programTokens[programID] = tokens
+	if tokens > p.maxActiveTokens {
+		p.maxActiveTokens = tokens
+	}
 }
 
 // getCacheScore retrieves the cache hit score (0.0 to 1.0)
