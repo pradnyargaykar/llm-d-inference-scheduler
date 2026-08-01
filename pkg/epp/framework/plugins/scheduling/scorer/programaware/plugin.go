@@ -142,10 +142,6 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 	maxActive := p.maxActiveTokens
 	p.tokensMu.RUnlock()
 
-	p.mu.RLock()
-	pinnedKey := p.pins[programID]
-	p.mu.RUnlock()
-
 	// 1. Relative Queue Load Normalization across candidate endpoints
 	minQueue := -1.0
 	maxQueue := 0.0
@@ -163,9 +159,6 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 		}
 	}
 	queueDiff := maxQueue - minQueue
-	if queueDiff < 1.0 {
-		queueDiff = 1.0
-	}
 
 	// 2. Relative KV Context Ratio (0.0 to 1.0) dynamically scaled by Max Workload KV
 	if maxActive < 1000 {
@@ -179,29 +172,45 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 	for _, endpoint := range endpoints {
 		podID := endpoint.GetMetadata().NamespacedName.String()
 
-		// Prefix Cache Match Ratio (0.0 to 1.0)
+		// 3. Prefix Cache Match Ratio (0.0 to 1.0)
 		cacheScore := p.getCacheScore(ctx, endpoint)
 
-		// Pin Affinity Boost (+1.0 if home pod, 0.0 otherwise)
-		pinBoost := 0.0
-		if pinnedKey != "" && podID == pinnedKey {
-			pinBoost = 1.0
-		}
-
-		// Relative Queue Load Penalty (0.0 to 1.0)
+		// 4. Endpoint Metrics
 		metrics := endpoint.GetMetrics()
 		queueSize := 0.0
+		kvUtil := 0.0
 		if metrics != nil {
 			queueSize = float64(metrics.WaitingQueueSize)
+			kvUtil = metrics.KVCacheUsagePercent
 		}
-		relLoad := (queueSize - minQueue) / queueDiff
 
-		// Physical KV Cache Recompute Penalty (0.0 to 1.0)
+		// 5. Absolute Queue Saturation (clamped to 1.0 at queue >= 20)
+		absQueueLoad := queueSize / 20.0
+		if absQueueLoad > 1.0 {
+			absQueueLoad = 1.0
+		}
+
+		// 6. Relative Queue Load
+		relQueueLoad := 0.0
+		if queueDiff >= 1.0 {
+			relQueueLoad = (queueSize - minQueue) / queueDiff
+		}
+
+		// 7. Triple-Guard Unified Load Penalty (0.0 to 1.0)
+		pLoad := absQueueLoad
+		if kvUtil > pLoad {
+			pLoad = kvUtil
+		}
+		if relQueueLoad > pLoad {
+			pLoad = relQueueLoad
+		}
+
+		// 8. Physical KV Cache Recompute Penalty (0.0 to 1.0)
 		recomputePenalty := (1.0 - cacheScore) * contextRatio
 
-		// Clean 2-Penalty Formula:
-		// Score = CacheScore + PinBoost - RelLoad - RecomputePenalty
-		score := cacheScore + pinBoost - relLoad - recomputePenalty
+		// Audited Universal Scorer Formula:
+		// Score = CacheScore - pLoad - RecomputePenalty
+		score := cacheScore - pLoad - recomputePenalty
 		scores[endpoint] = score
 
 		// Record metrics for observability
@@ -209,7 +218,7 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 
 		decisionType := "cache_miss"
 		if cacheScore > 0 {
-			if relLoad >= 0.75 {
+			if pLoad >= 0.75 {
 				decisionType = "cache_hit_saturated_migrate"
 				forcedMigrationsTotal.WithLabelValues(programID, podID).Inc()
 			} else {
@@ -218,12 +227,11 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 		}
 		routingDecisionsTotal.WithLabelValues(programID, podID, decisionType).Inc()
 
-		logger.V(logutil.VERBOSE).Info("Scored endpoint 2-penalty",
+		logger.V(logutil.VERBOSE).Info("Scored endpoint universal 2-penalty",
 			"endpoint", podID,
 			"programID", programID,
 			"cacheScore", cacheScore,
-			"pinBoost", pinBoost,
-			"relLoad", relLoad,
+			"pLoad", pLoad,
 			"recomputePenalty", recomputePenalty,
 			"contextRatio", contextRatio,
 			"finalScore", score)
