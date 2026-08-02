@@ -142,6 +142,10 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 	maxActive := p.maxActiveTokens
 	p.tokensMu.RUnlock()
 
+	p.mu.RLock()
+	pinnedKey := p.pins[programID]
+	p.mu.RUnlock()
+
 	// 1. Relative Queue Load Normalization across candidate endpoints
 	minQueue := -1.0
 	maxQueue := 0.0
@@ -175,7 +179,14 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 		// 3. Prefix Cache Match Ratio (0.0 to 1.0)
 		cacheScore := p.getCacheScore(ctx, endpoint)
 
-		// 4. Endpoint Metrics
+		// 4. Soft Pin Boost (+0.20 if home pod, 0.0 otherwise)
+		// Absorbs 1-3 transient queue blips on early turns, but cancels out at Queue >= 4 (4/20 = 0.20)
+		pinBoost := 0.0
+		if pinnedKey != "" && podID == pinnedKey {
+			pinBoost = 0.20
+		}
+
+		// 5. Endpoint Metrics
 		metrics := endpoint.GetMetrics()
 		queueSize := 0.0
 		kvUtil := 0.0
@@ -184,19 +195,19 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 			kvUtil = metrics.KVCacheUsagePercent
 		}
 
-		// 5. Absolute Queue Saturation (clamped to 1.0 at queue >= 20)
+		// 6. Absolute Queue Saturation (clamped to 1.0 at queue >= 20)
 		absQueueLoad := queueSize / 20.0
 		if absQueueLoad > 1.0 {
 			absQueueLoad = 1.0
 		}
 
-		// 6. Relative Queue Load
+		// 7. Relative Queue Load
 		relQueueLoad := 0.0
 		if queueDiff >= 1.0 {
 			relQueueLoad = (queueSize - minQueue) / queueDiff
 		}
 
-		// 7. Triple-Guard Unified Load Penalty (0.0 to 1.0)
+		// 8. Triple-Guard Unified Load Penalty (0.0 to 1.0)
 		pLoad := absQueueLoad
 		if kvUtil > pLoad {
 			pLoad = kvUtil
@@ -205,12 +216,12 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 			pLoad = relQueueLoad
 		}
 
-		// 8. Physical KV Cache Recompute Penalty (0.0 to 1.0)
+		// 9. Physical KV Cache Recompute Penalty (0.0 to 1.0)
 		recomputePenalty := (1.0 - cacheScore) * contextRatio
 
-		// Audited Universal Scorer Formula:
-		// Score = CacheScore - pLoad - RecomputePenalty
-		score := cacheScore - pLoad - recomputePenalty
+		// Audited Universal Soft-Pinning Scorer Formula:
+		// Score = CacheScore + PinBoost - pLoad - RecomputePenalty
+		score := cacheScore + pinBoost - pLoad - recomputePenalty
 		scores[endpoint] = score
 
 		// Record metrics for observability
@@ -227,10 +238,11 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 		}
 		routingDecisionsTotal.WithLabelValues(programID, podID, decisionType).Inc()
 
-		logger.V(logutil.VERBOSE).Info("Scored endpoint universal 2-penalty",
+		logger.V(logutil.VERBOSE).Info("Scored endpoint universal soft-pinning",
 			"endpoint", podID,
 			"programID", programID,
 			"cacheScore", cacheScore,
+			"pinBoost", pinBoost,
 			"pLoad", pLoad,
 			"recomputePenalty", recomputePenalty,
 			"contextRatio", contextRatio,
