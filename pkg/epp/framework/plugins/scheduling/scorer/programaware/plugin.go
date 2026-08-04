@@ -162,7 +162,6 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 			maxQueue = q
 		}
 	}
-	queueDiff := maxQueue - minQueue
 
 	// 2. Relative KV Context Ratio (0.0 to 1.0) dynamically scaled by Max Workload KV
 	if maxActive < 1000 {
@@ -195,33 +194,27 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 			kvUtil = metrics.KVCacheUsagePercent
 		}
 
-		// 6. Absolute Queue Saturation (clamped to 1.0 at queue >= 20)
-		absQueueLoad := queueSize / 20.0
-		if absQueueLoad > 1.0 {
-			absQueueLoad = 1.0
+		// 6. Unclamped Workload-Adaptive Queue Scaling (qScale dynamically adapts to max queue in cluster)
+		qScale := maxQueue
+		if qScale < 10.0 {
+			qScale = 10.0
 		}
+		absQueueLoad := queueSize / qScale
 
-		// 7. Relative Queue Load
-		relQueueLoad := 0.0
-		if queueDiff >= 1.0 {
-			relQueueLoad = (queueSize - minQueue) / queueDiff
-		}
+		// 7. Relative Queue Delta (0.10 penalty per extra queued request above cluster min)
+		relQueueDelta := (queueSize - minQueue) / 10.0
+		queuePenalty := absQueueLoad + relQueueDelta
 
-		// 8. Triple-Guard Unified Load Penalty (0.0 to 1.0)
-		pLoad := absQueueLoad
-		if kvUtil > pLoad {
-			pLoad = kvUtil
-		}
-		if relQueueLoad > pLoad {
-			pLoad = relQueueLoad
-		}
+		// 8. Decoupled Steep Memory Penalty (triggers only at >= 85% VRAM saturation)
+		kv8 := kvUtil * kvUtil * kvUtil * kvUtil * kvUtil * kvUtil * kvUtil * kvUtil
+		memPenalty := 0.50 * kv8
 
 		// 9. Physical KV Cache Recompute Penalty (0.0 to 1.0)
 		recomputePenalty := (1.0 - cacheScore) * contextRatio
 
-		// Audited Universal Soft-Pinning Scorer Formula:
-		// Score = CacheScore + PinBoost - pLoad - RecomputePenalty
-		score := cacheScore + pinBoost - pLoad - recomputePenalty
+		// Audited Dynamic Queue & Decoupled Memory Scorer Formula:
+		// Score = CacheScore + PinBoost - QueuePenalty - MemPenalty - RecomputePenalty
+		score := cacheScore + pinBoost - queuePenalty - memPenalty - recomputePenalty
 		scores[endpoint] = score
 
 		// Record metrics for observability
@@ -229,7 +222,7 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 
 		decisionType := "cache_miss"
 		if cacheScore > 0 {
-			if pLoad >= 0.75 {
+			if queuePenalty >= 0.75 || memPenalty >= 0.25 {
 				decisionType = "cache_hit_saturated_migrate"
 				forcedMigrationsTotal.WithLabelValues(programID, podID).Inc()
 			} else {
@@ -238,12 +231,15 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 		}
 		routingDecisionsTotal.WithLabelValues(programID, podID, decisionType).Inc()
 
-		logger.V(logutil.VERBOSE).Info("Scored endpoint universal soft-pinning",
+		logger.V(logutil.VERBOSE).Info("Scored endpoint dynamic queue decoupled memory",
 			"endpoint", podID,
 			"programID", programID,
 			"cacheScore", cacheScore,
 			"pinBoost", pinBoost,
-			"pLoad", pLoad,
+			"absQueueLoad", absQueueLoad,
+			"relQueueDelta", relQueueDelta,
+			"queuePenalty", queuePenalty,
+			"memPenalty", memPenalty,
 			"recomputePenalty", recomputePenalty,
 			"contextRatio", contextRatio,
 			"finalScore", score)
