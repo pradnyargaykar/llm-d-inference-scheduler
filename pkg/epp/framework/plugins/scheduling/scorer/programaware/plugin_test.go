@@ -65,11 +65,20 @@ func TestProgramAwareScorer(t *testing.T) {
 			ctx := context.Background()
 			p := programaware.New(ctx, "test-scorer", cfg)
 
-			p.SetProgramTokens("program-1", tc.tokensSoFar)
-
 			req := &scheduling.InferenceRequest{
 				FairnessID: "program-1",
 			}
+
+			// Commit pin for program-1 on pod-a
+			res := &scheduling.SchedulingResult{
+				PrimaryProfileName: "default",
+				ProfileResults: map[string]*scheduling.ProfileRunResult{
+					"default": {
+						TargetEndpoints: []scheduling.Endpoint{endpointA},
+					},
+				},
+			}
+			p.PreRequest(ctx, req, res)
 
 			scores := p.Score(ctx, req, []scheduling.Endpoint{endpointA, endpointB})
 

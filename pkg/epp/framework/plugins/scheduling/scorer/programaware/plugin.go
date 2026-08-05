@@ -59,6 +59,9 @@ type Plugin struct {
 	maxActiveTokens int64
 	tokensMu        sync.RWMutex
 
+	podInFlightPromptTokens map[string]int64
+	inFlightMu              sync.RWMutex
+
 	mu            sync.RWMutex
 	pins          map[string]string
 	podCount      map[string]int
@@ -102,14 +105,15 @@ func New(ctx context.Context, name string, cfg Config) *Plugin {
 	}
 
 	return &Plugin{
-		typedName:          plugin.TypedName{Type: ProgramAwareType, Name: name},
-		prefixMatchDataKey: attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(cfg.PrefixMatchInfoProducerName),
-		programTokens:      make(map[string]int64),
-		maxActiveTokens:    1000,
-		pins:               make(map[string]string),
-		podCount:           make(map[string]int),
-		misses:             make(map[string]int),
-		missThreshold:      missThreshold,
+		typedName:               plugin.TypedName{Type: ProgramAwareType, Name: name},
+		prefixMatchDataKey:      attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(cfg.PrefixMatchInfoProducerName),
+		programTokens:           make(map[string]int64),
+		maxActiveTokens:         1000,
+		podInFlightPromptTokens: make(map[string]int64),
+		pins:                    make(map[string]string),
+		podCount:                make(map[string]int),
+		misses:                  make(map[string]int),
+		missThreshold:           missThreshold,
 	}
 }
 
@@ -123,10 +127,10 @@ func (p *Plugin) Category() scheduling.ScorerCategory {
 	return scheduling.Affinity
 }
 
-// Score computes a clean model-agnostic, zero-tuning 2-penalty score for candidate endpoints.
-// Formula: Score_i = CacheScore + PinBoost - RelLoad - RecomputePenalty
+// Score computes scores based on Physical Token Burden
 func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, endpoints []scheduling.Endpoint) map[scheduling.Endpoint]float64 {
-	logger := log.FromContext(ctx)
+	logger := log.FromContext(ctx).V(logutil.VERBOSE)
+
 	scores := make(map[scheduling.Endpoint]float64, len(endpoints))
 	if len(endpoints) == 0 {
 		return scores
@@ -139,82 +143,56 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 
 	p.tokensMu.RLock()
 	tokensSoFar := p.programTokens[programID]
-	maxActive := p.maxActiveTokens
+	if tokensSoFar < 1000 {
+		tokensSoFar = 1000
+	}
 	p.tokensMu.RUnlock()
 
 	p.mu.RLock()
 	pinnedKey := p.pins[programID]
 	p.mu.RUnlock()
 
-	// 1. Relative Queue Load Normalization across candidate endpoints
-	minQueue := -1.0
-	maxQueue := 0.0
-	for _, ep := range endpoints {
-		m := ep.GetMetrics()
-		q := 0.0
-		if m != nil {
-			q = float64(m.WaitingQueueSize)
-		}
-		if minQueue < 0 || q < minQueue {
-			minQueue = q
-		}
-		if q > maxQueue {
-			maxQueue = q
-		}
-	}
-
-	// 2. Relative KV Context Ratio (0.0 to 1.0) dynamically scaled by Max Workload KV
-	if maxActive < 1000 {
-		maxActive = 1000
-	}
-	contextRatio := float64(tokensSoFar) / float64(maxActive)
-	if contextRatio > 1.0 {
-		contextRatio = 1.0
-	}
-
 	for _, endpoint := range endpoints {
 		podID := endpoint.GetMetadata().NamespacedName.String()
 
-		// 3. Prefix Cache Match Ratio (0.0 to 1.0)
+		// 1. Prefix Cache Warmth Match Score (0.0 to 1.0)
 		cacheScore := p.getCacheScore(ctx, endpoint)
 
-		// 4. Soft Pin Boost (+0.20 if home pod, 0.0 otherwise)
-		// Absorbs 1-3 transient queue blips on early turns, but cancels out at Queue >= 4 (4/20 = 0.20)
-		pinBoost := 0.0
-		if pinnedKey != "" && podID == pinnedKey {
-			pinBoost = 0.20
-		}
+		// 2. Queued Prompt Tokens in Line (Zero-lag in-flight prompt tokens)
+		p.inFlightMu.RLock()
+		queuedTokens := float64(p.podInFlightPromptTokens[podID])
+		p.inFlightMu.RUnlock()
 
-		// 5. Endpoint Metrics
+		// Endpoint Prometheus metrics fallback/supplement
 		metrics := endpoint.GetMetrics()
-		queueSize := 0.0
 		kvUtil := 0.0
 		if metrics != nil {
-			queueSize = float64(metrics.WaitingQueueSize)
 			kvUtil = metrics.KVCacheUsagePercent
+			promQueue := float64(metrics.WaitingQueueSize) * 500.0
+			if promQueue > queuedTokens {
+				queuedTokens = promQueue
+			}
 		}
 
-		// 6. Unclamped Workload-Adaptive Queue Scaling (qScale dynamically adapts to max queue in cluster)
-		qScale := maxQueue
-		if qScale < 10.0 {
-			qScale = 10.0
+		// 3. Missing Tokens to Recompute on Pod i
+		missingRecompute := (1.0 - cacheScore) * float64(tokensSoFar)
+
+		// 4. Decoupled Memory Wall Penalty (Triggers 5,000 token penalty at >= 85% VRAM)
+		memPenalty := 0.0
+		if kvUtil >= 0.85 {
+			memPenalty = 5000.0
 		}
-		absQueueLoad := queueSize / qScale
 
-		// 7. Relative Queue Delta (0.10 penalty per extra queued request above cluster min)
-		relQueueDelta := (queueSize - minQueue) / 10.0
-		queuePenalty := absQueueLoad + relQueueDelta
+		// 5. Conditional Cache-Hit Home Pod Pin Buffer (Grants 1,500 token buffer ONLY if Home Pod AND cacheScore > 0)
+		pinBuffer := 0.0
+		if pinnedKey != "" && podID == pinnedKey && cacheScore > 0.0 {
+			pinBuffer = 1500.0
+		}
 
-		// 8. Decoupled Steep Memory Penalty (triggers only at >= 85% VRAM saturation)
-		kv8 := kvUtil * kvUtil * kvUtil * kvUtil * kvUtil * kvUtil * kvUtil * kvUtil
-		memPenalty := 0.50 * kv8
-
-		// 9. Physical KV Cache Recompute Penalty (0.0 to 1.0)
-		recomputePenalty := (1.0 - cacheScore) * contextRatio
-
-		// Audited Dynamic Queue & Decoupled Memory Scorer Formula:
-		// Score = CacheScore + PinBoost - QueuePenalty - MemPenalty - RecomputePenalty
-		score := cacheScore + pinBoost - queuePenalty - memPenalty - recomputePenalty
+		// Total Physical Token Burden Calculation:
+		// TokenBurden = QueuedTokens + MissingRecompute + MemPenalty - PinBuffer
+		tokenBurden := queuedTokens + missingRecompute + memPenalty - pinBuffer
+		score := -tokenBurden
 		scores[endpoint] = score
 
 		// Record metrics for observability
@@ -222,7 +200,7 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 
 		decisionType := "cache_miss"
 		if cacheScore > 0 {
-			if queuePenalty >= 0.75 || memPenalty >= 0.25 {
+			if queuedTokens >= 10000.0 || memPenalty >= 1000.0 {
 				decisionType = "cache_hit_saturated_migrate"
 				forcedMigrationsTotal.WithLabelValues(programID, podID).Inc()
 			} else {
@@ -231,17 +209,15 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 		}
 		routingDecisionsTotal.WithLabelValues(programID, podID, decisionType).Inc()
 
-		logger.V(logutil.VERBOSE).Info("Scored endpoint dynamic queue decoupled memory",
+		logger.Info("Scored endpoint token-balance physical",
 			"endpoint", podID,
 			"programID", programID,
 			"cacheScore", cacheScore,
-			"pinBoost", pinBoost,
-			"absQueueLoad", absQueueLoad,
-			"relQueueDelta", relQueueDelta,
-			"queuePenalty", queuePenalty,
+			"queuedTokens", queuedTokens,
+			"missingRecompute", missingRecompute,
 			"memPenalty", memPenalty,
-			"recomputePenalty", recomputePenalty,
-			"contextRatio", contextRatio,
+			"pinBuffer", pinBuffer,
+			"tokenBurden", tokenBurden,
 			"finalScore", score)
 	}
 
@@ -277,7 +253,7 @@ func (p *Plugin) leastLoadedPod(endpoints []scheduling.Endpoint) scheduling.Endp
 	return byKey[candidates[p.rrCursor%len(candidates)]]
 }
 
-// PreRequest tracks pin commitments and token usage.
+// PreRequest tracks pin commitments and in-flight prompt tokens.
 func (p *Plugin) PreRequest(ctx context.Context, req *scheduling.InferenceRequest, result *scheduling.SchedulingResult) {
 	if result == nil {
 		return
@@ -294,9 +270,7 @@ func (p *Plugin) PreRequest(ctx context.Context, req *scheduling.InferenceReques
 	}
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.rrCursor++
-
 	existing, pinned := p.pins[programID]
 	switch {
 	case !pinned:
@@ -317,11 +291,39 @@ func (p *Plugin) PreRequest(ctx context.Context, req *scheduling.InferenceReques
 			delete(p.misses, programID)
 		}
 	}
+	p.mu.Unlock()
+
+	// Track in-flight prompt tokens
+	promptTokens := int64(1000)
+	p.tokensMu.RLock()
+	if t, ok := p.programTokens[programID]; ok && t > 0 {
+		promptTokens = t
+	}
+	p.tokensMu.RUnlock()
+
+	p.inFlightMu.Lock()
+	p.podInFlightPromptTokens[chosen] += promptTokens
+	p.inFlightMu.Unlock()
 }
 
 // ResponseBody processes token counts from response stream.
 func (p *Plugin) ResponseBody(ctx context.Context, req *scheduling.InferenceRequest, resp *requestcontrol.Response, targetEndpoint *datalayer.EndpointMetadata) {
-	if !resp.EndOfStream {
+	if targetEndpoint != nil {
+		podID := targetEndpoint.NamespacedName.String()
+		promptTokens := int64(1000)
+		if resp != nil && resp.Usage.PromptTokens > 0 {
+			promptTokens = int64(resp.Usage.PromptTokens)
+		}
+
+		p.inFlightMu.Lock()
+		p.podInFlightPromptTokens[podID] -= promptTokens
+		if p.podInFlightPromptTokens[podID] < 0 {
+			p.podInFlightPromptTokens[podID] = 0
+		}
+		p.inFlightMu.Unlock()
+	}
+
+	if resp == nil || !resp.EndOfStream {
 		return
 	}
 
