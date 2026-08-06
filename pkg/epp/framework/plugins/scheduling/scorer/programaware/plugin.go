@@ -146,25 +146,16 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 	pinnedKey := p.pins[programID]
 	p.mu.RUnlock()
 
-	// 1. Relative Queue Load Normalization across candidate endpoints
-	minQueue := -1.0
+	// 1. Max Queue Load across candidate endpoints
 	maxQueue := 0.0
 	for _, ep := range endpoints {
 		m := ep.GetMetrics()
-		q := 0.0
 		if m != nil {
-			q = float64(m.WaitingQueueSize)
+			q := float64(m.WaitingQueueSize)
+			if q > maxQueue {
+				maxQueue = q
+			}
 		}
-		if minQueue < 0 || q < minQueue {
-			minQueue = q
-		}
-		if q > maxQueue {
-			maxQueue = q
-		}
-	}
-	queueDiff := maxQueue - minQueue
-	if queueDiff < 1.0 {
-		queueDiff = 1.0
 	}
 
 	// 2. Relative KV Context Ratio (0.0 to 1.0) dynamically scaled by Max Workload KV
@@ -188,13 +179,17 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 			pinBoost = 1.0
 		}
 
-		// Relative Queue Load Penalty (0.0 to 1.0)
+		// Relative Queue Load Penalty (0.0 to 1.0) non-linear quadratic scaling
 		metrics := endpoint.GetMetrics()
 		queueSize := 0.0
 		if metrics != nil {
 			queueSize = float64(metrics.WaitingQueueSize)
 		}
-		relLoad := (queueSize - minQueue) / queueDiff
+		relLoad := 0.0
+		if maxQueue > 0 {
+			normLoad := queueSize / maxQueue
+			relLoad = normLoad * normLoad
+		}
 
 		// Physical KV Cache Recompute Penalty (0.0 to 1.0)
 		recomputePenalty := (1.0 - cacheScore) * contextRatio
