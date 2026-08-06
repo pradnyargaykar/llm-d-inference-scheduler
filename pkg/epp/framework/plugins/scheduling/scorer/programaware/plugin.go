@@ -148,51 +148,60 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 	}
 	p.tokensMu.RUnlock()
 
-	p.mu.RLock()
-	pinnedKey := p.pins[programID]
-	p.mu.RUnlock()
-
 	for _, endpoint := range endpoints {
 		podID := endpoint.GetMetadata().NamespacedName.String()
 
 		// 1. Prefix Cache Warmth Match Score (0.0 to 1.0)
 		cacheScore := p.getCacheScore(ctx, endpoint)
 
-		// 2. Queued Prompt Tokens in Line (Zero-lag in-flight prompt tokens)
+		// 2. Queued Tokens in Line (Effective Queue Requests * Average Context Tokens)
 		p.inFlightMu.RLock()
-		queuedTokens := float64(p.podInFlightPromptTokens[podID])
+		inFlightReqs := float64(p.podInFlightPromptTokens[podID]) / 1000.0
 		p.inFlightMu.RUnlock()
 
-		// Endpoint Prometheus metrics fallback/supplement
 		metrics := endpoint.GetMetrics()
 		kvUtil := 0.0
+		effectiveQueueReqs := inFlightReqs
 		if metrics != nil {
 			kvUtil = metrics.KVCacheUsagePercent
-			promQueue := float64(metrics.WaitingQueueSize) * 500.0
-			if promQueue > queuedTokens {
-				queuedTokens = promQueue
+			promQueue := float64(metrics.WaitingQueueSize)
+			if promQueue > effectiveQueueReqs {
+				effectiveQueueReqs = promQueue
 			}
 		}
 
-		// 3. Missing Tokens to Recompute on Pod i
-		missingRecompute := (1.0 - cacheScore) * float64(tokensSoFar)
-
-		// 4. Decoupled Memory Wall Penalty (Triggers 5,000 token penalty at >= 85% VRAM)
-		memPenalty := 0.0
-		if kvUtil >= 0.85 {
-			memPenalty = 5000.0
+		p.tokensMu.RLock()
+		avgContext := float64(p.maxActiveTokens)
+		if avgContext < 1000.0 {
+			avgContext = 1000.0
 		}
+		p.tokensMu.RUnlock()
 
-		// 5. Conditional Cache-Hit Home Pod Pin Buffer (Grants 1,500 token buffer ONLY if Home Pod AND cacheScore > 0)
+		queuedTokensInLine := effectiveQueueReqs * avgContext
+
+		// 3. Warm Cached Tokens Saved on Pod i
+		cachedTokensSaved := cacheScore * float64(tokensSoFar)
+
+		p.mu.RLock()
+		pinnedKey := p.pins[programID]
+		p.mu.RUnlock()
+
+		// 4. Conditional Cache-Hit Home Pod Pin Buffer (Grants 1,500 token buffer ONLY if Home Pod AND cacheScore > 0)
 		pinBuffer := 0.0
 		if pinnedKey != "" && podID == pinnedKey && cacheScore > 0.0 {
 			pinBuffer = 1500.0
 		}
 
-		// Total Physical Token Burden Calculation:
-		// TokenBurden = QueuedTokens + MissingRecompute + MemPenalty - PinBuffer
-		tokenBurden := queuedTokens + missingRecompute + memPenalty - pinBuffer
-		score := -tokenBurden
+		// 5. Decoupled Memory Wall Penalty (Triggers 5,000 token penalty at >= 85% VRAM)
+		memPenalty := 0.0
+		if kvUtil >= 0.85 {
+			memPenalty = 5000.0
+		}
+
+		// Universal Hardware-Agnostic Net Token Burden Calculation:
+		// NetBurden = QueuedTokensInLine - CachedTokensSaved + MemPenalty - PinBuffer
+		netBurden := queuedTokensInLine - cachedTokensSaved + memPenalty - pinBuffer
+		score := -netBurden
 		scores[endpoint] = score
 
 		// Record metrics for observability
@@ -200,7 +209,7 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 
 		decisionType := "cache_miss"
 		if cacheScore > 0 {
-			if queuedTokens >= 10000.0 || memPenalty >= 1000.0 {
+			if queuedTokensInLine >= 10000.0 || memPenalty >= 1000.0 {
 				decisionType = "cache_hit_saturated_migrate"
 				forcedMigrationsTotal.WithLabelValues(programID, podID).Inc()
 			} else {
@@ -209,15 +218,14 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 		}
 		routingDecisionsTotal.WithLabelValues(programID, podID, decisionType).Inc()
 
-		logger.Info("Scored endpoint token-balance physical",
+		logger.Info("Scored endpoint universal hardware-agnostic token-balance",
 			"endpoint", podID,
 			"programID", programID,
 			"cacheScore", cacheScore,
-			"queuedTokens", queuedTokens,
-			"missingRecompute", missingRecompute,
+			"queuedTokensInLine", queuedTokensInLine,
+			"cachedTokensSaved", cachedTokensSaved,
 			"memPenalty", memPenalty,
-			"pinBuffer", pinBuffer,
-			"tokenBurden", tokenBurden,
+			"netBurden", netBurden,
 			"finalScore", score)
 	}
 
