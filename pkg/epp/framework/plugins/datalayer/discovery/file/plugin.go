@@ -26,6 +26,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 
@@ -71,6 +72,11 @@ type FileDiscovery struct {
 	typedName fwkplugin.TypedName
 	path      string
 	watchFile bool
+	// validateAddress checks an endpoint address. Injected at construction so a
+	// variant can loosen it without load() branching on the plugin type.
+	validateAddress func(string) error
+	// mu guards endpoints, which DumpState reads concurrently with load.
+	mu sync.RWMutex
 	// endpoints is the set of endpoint identities applied to the datastore
 	// from the last successful load. Used as a key set only -- values are
 	// zero-byte structs. Compared against the entries parsed during a
@@ -81,11 +87,20 @@ type FileDiscovery struct {
 	readyOnce sync.Once
 }
 
-var _ fwkdl.EndpointDiscovery = (*FileDiscovery)(nil)
+var (
+	_ fwkdl.EndpointDiscovery = (*FileDiscovery)(nil)
+	_ fwkplugin.StateDumper   = (*FileDiscovery)(nil)
+)
 
-// Factory is the plugin factory for file-discovery.
+// Factory is the plugin factory for file-discovery. Endpoint addresses must be IPv4.
 func Factory(name string, parameters *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
-	p := &params{WatchFile: false}
+	return newFileDiscovery(PluginType, name, parameters, validateIPv4Address)
+}
+
+// newFileDiscovery decodes the shared file-discovery parameters and builds a
+// FileDiscovery with the given address validator. name defaults to pluginType.
+func newFileDiscovery(pluginType, name string, parameters *json.Decoder, validateAddress func(string) error) (*FileDiscovery, error) {
+	p := &params{}
 	if parameters != nil {
 		if err := parameters.Decode(p); err != nil {
 			return nil, fmt.Errorf("file-discovery: failed to parse parameters: %w", err)
@@ -95,18 +110,62 @@ func Factory(name string, parameters *json.Decoder, _ fwkplugin.Handle) (fwkplug
 		return nil, errors.New("file-discovery: 'path' parameter is required")
 	}
 	if name == "" {
-		name = PluginType
+		name = pluginType
 	}
 	return &FileDiscovery{
-		typedName: fwkplugin.TypedName{Type: PluginType, Name: name},
-		path:      p.Path,
-		watchFile: p.WatchFile,
-		endpoints: make(map[types.NamespacedName]struct{}),
-		ready:     make(chan struct{}),
+		typedName:       fwkplugin.TypedName{Type: pluginType, Name: name},
+		path:            p.Path,
+		watchFile:       p.WatchFile,
+		validateAddress: validateAddress,
+		endpoints:       make(map[types.NamespacedName]struct{}),
+		ready:           make(chan struct{}),
 	}, nil
 }
 
+// validateIPv4Address requires the address to be an IPv4 literal, matching the pod
+// discovery contract.
+func validateIPv4Address(address string) error {
+	if ip := net.ParseIP(address); ip == nil || ip.To4() == nil {
+		return fmt.Errorf("invalid IPv4 address %q", address)
+	}
+	return nil
+}
+
 func (f *FileDiscovery) TypedName() fwkplugin.TypedName { return f.typedName }
+
+const maxDebugDumpEndpoints = 100
+
+// discoveryState is the sanitized snapshot returned by DumpState: discovered
+// endpoint identities only, never their addresses or labels. The dump is partial
+// when TotalEndpoints exceeds MaxEndpoints.
+type discoveryState struct {
+	Endpoints      []string `json:"endpoints"`
+	TotalEndpoints int      `json:"totalEndpoints"`
+	MaxEndpoints   int      `json:"maxEndpoints"`
+}
+
+// DumpState reports the endpoint identities currently loaded from the file,
+// sorted and capped to maxDebugDumpEndpoints so the payload stays bounded. The
+// set is snapshotted under a read lock, so a concurrent reload may not yet be
+// reflected; best-effort visibility is enough for a debug endpoint.
+func (f *FileDiscovery) DumpState() (json.RawMessage, error) {
+	f.mu.RLock()
+	names := make([]string, 0, len(f.endpoints))
+	for id := range f.endpoints {
+		names = append(names, id.String())
+	}
+	f.mu.RUnlock()
+
+	total := len(names)
+	sort.Strings(names)
+
+	state := discoveryState{TotalEndpoints: total, MaxEndpoints: maxDebugDumpEndpoints}
+	if len(names) > maxDebugDumpEndpoints {
+		names = names[:maxDebugDumpEndpoints]
+	}
+	state.Endpoints = names
+	return json.Marshal(state)
+}
 
 // Ready returns a channel closed after the first successful load of the
 // endpoints file. See EndpointDiscovery.Ready for the contract.
@@ -198,8 +257,8 @@ func (f *FileDiscovery) load(notifier fwkdl.DiscoveryNotifier) error {
 	incoming := make(map[types.NamespacedName]struct{}, len(ef.Endpoints))
 	var errs []error
 	for _, e := range ef.Endpoints {
-		if ip := net.ParseIP(e.Address); ip == nil || ip.To4() == nil {
-			errs = append(errs, fmt.Errorf("endpoint %q: invalid IPv4 address %q", e.Name, e.Address))
+		if err := f.validateAddress(e.Address); err != nil {
+			errs = append(errs, fmt.Errorf("endpoint %q: %w", e.Name, err))
 			continue
 		}
 		if portNum, err := strconv.Atoi(e.Port); err != nil || portNum < 1 || portNum > 65535 {
@@ -211,22 +270,26 @@ func (f *FileDiscovery) load(notifier fwkdl.DiscoveryNotifier) error {
 			ns = "default"
 		}
 		meta := &fwkdl.EndpointMetadata{
-			NamespacedName: types.NamespacedName{Name: e.Name, Namespace: ns},
-			PodName:        e.Name,
-			Address:        e.Address,
-			Port:           e.Port,
-			MetricsHost:    net.JoinHostPort(e.Address, e.Port),
-			Labels:         e.Labels,
+			ID:          types.NamespacedName{Name: e.Name, Namespace: ns},
+			Name:        e.Name,
+			Address:     e.Address,
+			Port:        e.Port,
+			MetricsHost: net.JoinHostPort(e.Address, e.Port),
+			Labels:      e.Labels,
 		}
-		incoming[meta.NamespacedName] = struct{}{}
+		incoming[meta.ID] = struct{}{}
 		notifier.Upsert(meta)
 	}
 
-	for id := range f.endpoints {
+	f.mu.Lock()
+	old := f.endpoints
+	f.endpoints = incoming
+	f.mu.Unlock()
+
+	for id := range old {
 		if _, ok := incoming[id]; !ok {
 			notifier.Delete(id)
 		}
 	}
-	f.endpoints = incoming
 	return errors.Join(errs...)
 }

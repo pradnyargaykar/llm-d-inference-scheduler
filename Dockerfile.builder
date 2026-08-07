@@ -1,11 +1,11 @@
-FROM golang:1.25.11
+FROM golang:1.26.5
 
 RUN mkdir /app
 WORKDIR /app
 
 ARG TYPOS_VERSION=v1.34.0
 ARG KIND_VERSION=v0.27.0
-ARG GOLANGCI_LINT_VERSION=v2.8.0
+ARG GOLANGCI_LINT_VERSION=v2.10.0
 ARG KUBECTL_VERSION=v1.35.3
 ARG KUSTOMIZE_VERSION=v5.6.0
 ARG DOCKER_VERSION=29.3.0
@@ -13,6 +13,8 @@ ARG DOCKER_BUILDX_VERSION=v0.32.1
 ARG ENVTEST_VERSION=release-0.19
 ARG ENVTEST_K8S_VERSION=1.31.0
 ARG GOVULNCHECK_VERSION=v1.3.0
+
+RUN apt-get update && apt-get install -y podman && apt-get clean all
 
 # Install docker CLI and buildx plugin
 RUN ARCH=$(uname -m) && \
@@ -60,6 +62,11 @@ ENV ENVTEST_K8S_VERSION=${ENVTEST_K8S_VERSION}
 # --userns=keep-id / -u <uid> can use the binary without writing to root-owned
 # /usr/local/bin.
 RUN GOBIN=/usr/local/bin go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}
+
+# Install the ginkgo CLI. Build-time install ensures runtime invocations under
+# --userns=keep-id / -u <uid> can use the binary without writing to root-owned
+# /usr/local/bin.
+RUN GOBIN=/usr/local/bin go install github.com/onsi/ginkgo/v2/ginkgo@v2.28.3
 
 # Go caches are mounted as volumes at runtime for persistence across image rebuilds.
 # Directories are created with open permissions so non-root users (docker -u) can write.

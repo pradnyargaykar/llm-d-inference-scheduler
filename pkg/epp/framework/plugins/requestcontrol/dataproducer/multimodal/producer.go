@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -59,6 +60,7 @@ var (
 	_ requestcontrol.DataProducer = &Producer{}
 	_ requestcontrol.PreRequest   = &Producer{}
 	_ fwkdl.EndpointExtractor     = &Producer{}
+	_ plugin.StateDumper          = &Producer{}
 )
 
 // Parameters configures the multimodal encoder-cache data producer.
@@ -172,6 +174,77 @@ func (p *Producer) TypedName() plugin.TypedName {
 	return p.typedName
 }
 
+const maxDebugDumpPods = 100
+
+// encoderCacheState is the snapshot returned by DumpState: the known pods from
+// the datalayer and per-pod cached-item counts. The multimodal content hashes
+// (the cache keys) are not exposed. Both lists are capped at MaxPods (PodList by
+// name, Pods by item count) and a list is partial when its matching total
+// exceeds MaxPods. PodList is sampled just before the per-pod view rather than
+// atomically with it, so the snapshot is best-effort: the two need not be
+// perfectly consistent, and a freshly tracked pod can appear in Pods but not yet
+// in PodList.
+type encoderCacheState struct {
+	PodList        []string       `json:"podList"`
+	TotalKnownPods int            `json:"totalKnownPods"`
+	Pods           []podItemCount `json:"pods"`
+	TotalPods      int            `json:"totalPods"`
+	MaxPods        int            `json:"maxPods"`
+}
+
+type podItemCount struct {
+	Pod   string `json:"pod"`
+	Items int    `json:"items"`
+}
+
+// DumpState reports the known pods from the datalayer and how many encoder-cache
+// items are tracked per pod, ordered by count (most first) and capped to
+// maxDebugDumpPods so the payload stays bounded. Pod identities and counts are
+// exposed; the content hashes (cache keys) are not.
+func (p *Producer) DumpState() (json.RawMessage, error) {
+	// podList() is the datalayer accessor; call it outside the cache lock, as
+	// removeStalePods does.
+	podList := []string{}
+	var totalKnownPods int
+	if p.podList != nil {
+		known := p.podList()
+		totalKnownPods = len(known)
+		podList = make([]string, 0, len(known))
+		for _, nn := range known {
+			podList = append(podList, nn.String())
+		}
+		sort.Strings(podList)
+		if len(podList) > maxDebugDumpPods {
+			podList = podList[:maxDebugDumpPods]
+		}
+	}
+
+	p.mutex.RLock()
+	state := encoderCacheState{
+		PodList:        podList,
+		TotalKnownPods: totalKnownPods,
+		MaxPods:        maxDebugDumpPods,
+		TotalPods:      len(p.caches),
+	}
+	pods := make([]podItemCount, 0, len(p.caches))
+	for pod, cache := range p.caches {
+		pods = append(pods, podItemCount{Pod: pod, Items: cache.Len()})
+	}
+	p.mutex.RUnlock()
+
+	sort.SliceStable(pods, func(a, b int) bool {
+		if pods[a].Items != pods[b].Items {
+			return pods[a].Items > pods[b].Items
+		}
+		return pods[a].Pod < pods[b].Pod
+	})
+	if len(pods) > maxDebugDumpPods {
+		pods = pods[:maxDebugDumpPods]
+	}
+	state.Pods = pods
+	return json.Marshal(state)
+}
+
 // Produces returns the data keys this plugin produces.
 func (p *Producer) Produces() map[plugin.DataKey]any {
 	return map[plugin.DataKey]any{p.dk: attrmm.EncoderCacheMatchInfo{}}
@@ -210,7 +283,8 @@ func (p *Producer) Produce(ctx context.Context, request *scheduling.InferenceReq
 		if metadata == nil {
 			continue
 		}
-		matchedItems := p.matchedItemsForPod(metadata.NamespacedName.String(), requestItems)
+		matchedItems := p.matchedItemsForPod(metadata.ID.String(), requestItems)
+		p.recordHitRatio(len(matchedItems), len(requestItems))
 		endpoint.Put(p.dk.String(), attrmm.NewEncoderCacheMatchInfo(
 			matchedItems,
 			requestItems,
@@ -232,13 +306,13 @@ func ExtractMMItems(request *scheduling.InferenceRequest) []attrmm.MatchItem {
 		if feature.Hash == "" {
 			continue
 		}
-		addItem(itemsByHash, feature.Hash)
+		addItem(itemsByHash, feature.Hash, string(feature.Modality))
 	}
 	return itemSlice(itemsByHash)
 }
 
-func addItem(itemsByHash map[string]attrmm.MatchItem, hash string) {
-	itemsByHash[hash] = attrmm.MatchItem{Hash: hash, Size: 1}
+func addItem(itemsByHash map[string]attrmm.MatchItem, hash, modality string) {
+	itemsByHash[hash] = attrmm.MatchItem{Hash: hash, Size: 1, Modality: modality}
 }
 
 func itemSlice(itemsByHash map[string]attrmm.MatchItem) []attrmm.MatchItem {
@@ -260,13 +334,24 @@ func (p *Producer) recordItemLookups(items []attrmm.MatchItem) {
 	defer p.mutex.RUnlock()
 	pluginType, pluginName := p.typedName.Type, p.typedName.Name
 	for _, item := range items {
-		encoderCacheQueriesTotal.WithLabelValues(pluginType, pluginName).Inc()
+		encoderCacheQueriesTotal.WithLabelValues(pluginType, pluginName, item.Modality).Inc()
 		for pod, podCache := range p.caches {
 			if podCache.Contains(item.Hash) {
-				encoderCacheHitsTotal.WithLabelValues(pluginType, pluginName, pod).Inc()
+				encoderCacheHitsTotal.WithLabelValues(pluginType, pluginName, pod, item.Modality).Inc()
 			}
 		}
 	}
+}
+
+// recordHitRatio observes the fraction of a request's multimodal items that
+// matched a single endpoint's LRU. A zero total is not a meaningful ratio and
+// is not observed.
+func (p *Producer) recordHitRatio(matchedItems, totalItems int) {
+	if totalItems == 0 {
+		return
+	}
+	ratio := float64(matchedItems) / float64(totalItems)
+	encoderCacheHitRatio.WithLabelValues(p.typedName.Type, p.typedName.Name).Observe(ratio)
 }
 
 func (p *Producer) matchedItemsForPod(pod string, requestItems []attrmm.MatchItem) []attrmm.MatchItem {
@@ -314,12 +399,12 @@ func (p *Producer) Extract(ctx context.Context, event fwkdl.EndpointEvent) error
 		return nil
 	}
 	metadata := event.Endpoint.GetMetadata()
-	if metadata == nil || metadata.NamespacedName.Name == "" {
+	if metadata == nil || metadata.ID.Name == "" {
 		return nil
 	}
-	p.removePod(metadata.NamespacedName.String())
+	p.removePod(metadata.ID.String())
 	log.FromContext(ctx).V(logging.DEBUG).Info("Removed stale pod from multimodal encoder-cache state",
-		"pod", metadata.NamespacedName.String())
+		"pod", metadata.ID.String())
 	return nil
 }
 

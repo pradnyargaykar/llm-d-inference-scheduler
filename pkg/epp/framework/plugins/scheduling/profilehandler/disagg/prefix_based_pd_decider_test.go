@@ -39,9 +39,9 @@ const (
 func makeTestEndpointBase() scheduling.Endpoint {
 	return scheduling.NewEndpoint(
 		&fwkdl.EndpointMetadata{
-			NamespacedName: k8stypes.NamespacedName{Namespace: "default", Name: "test-pod"},
-			Address:        testEndpointAddr,
-			Port:           testEndpointPort,
+			ID:      k8stypes.NamespacedName{Namespace: "default", Name: "test-pod"},
+			Address: testEndpointAddr,
+			Port:    testEndpointPort,
 		},
 		nil,
 		fwkdl.NewAttributes(),
@@ -67,7 +67,7 @@ func withTokens(req *scheduling.InferenceRequest, n int) *scheduling.InferenceRe
 	if req.Body.TokenizedPrompt == nil {
 		req.Body.TokenizedPrompt = &fwkrh.TokenizedPrompt{}
 	}
-	req.Body.TokenizedPrompt.TokenIDs = make([]uint32, n)
+	req.Body.TokenizedPrompt.PerPromptTokens = [][]uint32{make([]uint32, n)}
 	return req
 }
 
@@ -110,6 +110,20 @@ func TestGetUserInputLenInTokens(t *testing.T) {
 			wantMin: 1,
 		},
 		{
+			name: "completions string array prompt",
+			req: &scheduling.InferenceRequest{
+				Body: &fwkrh.InferenceRequestBody{
+					Completions: &fwkrh.CompletionsRequest{
+						Prompt: fwkrh.Prompt{
+							Strings: []string{"hello world", "foo bar baz"},
+						},
+					},
+					TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{make([]uint32, 5)}},
+				},
+			},
+			want: 5,
+		},
+		{
 			name:     "empty completions prompt",
 			req:      completionsRequest(""),
 			wantZero: true,
@@ -147,7 +161,7 @@ func TestGetUserInputLenInTokens(t *testing.T) {
 			req: &scheduling.InferenceRequest{
 				Body: &fwkrh.InferenceRequestBody{
 					Generate:        &fwkrh.GenerateRequest{TokenIDs: []uint32{1, 2, 3, 4, 5, 6, 7}},
-					TokenizedPrompt: &fwkrh.TokenizedPrompt{TokenIDs: make([]uint32, 7)},
+					TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{make([]uint32, 7)}},
 				},
 			},
 			want: 7,
@@ -274,9 +288,11 @@ func TestDisaggregate(t *testing.T) {
 	tests := []struct {
 		name               string
 		nonCachedTokens    int
+		promptTokens       int
 		request            *scheduling.InferenceRequest
 		endpoint           scheduling.Endpoint
 		expectDisaggregate bool
+		expectErr          bool
 	}{
 		{
 			name:               "threshold zero disables disaggregation",
@@ -300,11 +316,35 @@ func TestDisaggregate(t *testing.T) {
 			expectDisaggregate: false,
 		},
 		{
+			name:               "input shorter than promptTokens threshold",
+			nonCachedTokens:    5,
+			promptTokens:       20,
+			request:            makeRequestWithTokens(10),
+			endpoint:           makeTestEndpoint(0),
+			expectDisaggregate: false,
+		},
+		{
+			name:            "negative promptTokens is invalid",
+			nonCachedTokens: 5,
+			promptTokens:    -1,
+			request:         makeRequestWithTokens(10),
+			endpoint:        makeTestEndpoint(0),
+			expectErr:       true,
+		},
+		{
 			name:               "input shorter than threshold",
 			nonCachedTokens:    20,
 			request:            makeRequestWithTokens(10),
 			endpoint:           makeTestEndpoint(0),
 			expectDisaggregate: false,
+		},
+		{
+			name:               "input equals promptTokens threshold",
+			nonCachedTokens:    5,
+			promptTokens:       10,
+			request:            makeRequestWithTokens(10),
+			endpoint:           makeTestEndpoint(5),
+			expectDisaggregate: true,
 		},
 		{
 			name:               "non-cached suffix below threshold",
@@ -345,13 +385,67 @@ func TestDisaggregate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			decider, err := NewPrefixBasedPDDecider(PrefixBasedPDDeciderConfig{NonCachedTokens: tt.nonCachedTokens})
+			decider, err := NewPrefixBasedPDDecider(PrefixBasedPDDeciderConfig{
+				NonCachedTokens: tt.nonCachedTokens,
+				PromptTokens:    tt.promptTokens,
+			})
+			if tt.expectErr {
+				require.Error(t, err)
+				return
+			}
 			require.NoError(t, err)
 
 			result := decider.disaggregate(ctx, tt.request, tt.endpoint)
 			assert.Equal(t, tt.expectDisaggregate, result)
 		})
 	}
+}
+
+// TestDisaggregate_UsesUnweightedCachedBlockCount reproduces the #1047
+// RAM-cache misrouting scenario. The precise prefix cache scorer stores a
+// device-tier-weighted match score in matchBlocks (RAM tier = 0.8), but the
+// literal cached-block count lives in cachedBlockCount. The decider must use
+// the unweighted count so a mostly-RAM-cached prompt is not pushed onto the
+// remote-prefill path.
+//
+// Issue parameters: blockSize=16, inputTokens=4096, a 240-block contiguous hit
+// (3840 cached tokens, real non-cached suffix 256), threshold 512.
+func TestDisaggregate_UsesUnweightedCachedBlockCount(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+
+	const (
+		blockSize        = 16
+		inputTokens      = 4096
+		totalBlocks      = inputTokens / blockSize // 256
+		cachedBlocks     = 240                     // contiguous hit (3840 tokens)
+		ramWeightedScore = 192                     // int(240 * 0.8) as stored in matchBlocks
+		nonCachedTokens  = 512
+	)
+
+	newEndpoint := func(info *attrprefix.PrefixCacheMatchInfo) scheduling.Endpoint {
+		ep := makeTestEndpointBase()
+		ep.Put(attrprefix.PrefixCacheMatchInfoDataKey.String(), info)
+		return ep
+	}
+	// Exact token count via the tokenized-prompt path the decider reads.
+	req := withTokens(completionsRequestWithPrompt(fwkrh.Prompt{}), inputTokens)
+
+	decider, err := NewPrefixBasedPDDecider(PrefixBasedPDDeciderConfig{NonCachedTokens: nonCachedTokens})
+	require.NoError(t, err)
+
+	// Fixed behavior: cachedBlockCount carries the true 240 blocks, so
+	// nonCached = 4096 - 240*16 = 256 < 512 → decode-only (no remote prefill).
+	fixed := newEndpoint(attrprefix.NewPrefixCacheMatchInfo(ramWeightedScore, totalBlocks, blockSize).
+		WithCachedBlockCount(cachedBlocks))
+	assert.False(t, decider.disaggregate(ctx, req, fixed),
+		"RAM-cached prefix must stay decode-only when the unweighted cached-block count is used")
+
+	// Buggy behavior guard: if only the tier-weighted score (192) were
+	// available as the block count, nonCached = 4096 - 192*16 = 1024 >= 512
+	// would misroute to remote prefill.
+	weightedOnly := newEndpoint(attrprefix.NewPrefixCacheMatchInfo(ramWeightedScore, totalBlocks, blockSize))
+	assert.True(t, decider.disaggregate(ctx, req, weightedOnly),
+		"sanity: the tier-weighted score alone undercounts cached blocks and misroutes")
 }
 
 func TestDisaggregateNoPrefixInfo(t *testing.T) {
@@ -383,7 +477,7 @@ func TestConsumes(t *testing.T) {
 
 	handler, err := NewPdProfileHandler(
 		"test-handler",
-		pdProfileHandlerParameters{
+		PdProfileHandlerParameters{
 			PrefillProfile:              "prefill",
 			DecodeProfile:               "decode",
 			PrefixMatchInfoProducerName: "test",

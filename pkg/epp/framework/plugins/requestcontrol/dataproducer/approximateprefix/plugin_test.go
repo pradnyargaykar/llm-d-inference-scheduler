@@ -32,6 +32,7 @@ import (
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/prefixhash"
 )
 
 func testHandle() plugin.Handle {
@@ -52,7 +53,7 @@ func disableMinBlockSizeClamp(t *testing.T) {
 // tokenizedBody returns a request body carrying only a tokenized prompt.
 func tokenizedBody(tokenIDs []uint32) *fwkrh.InferenceRequestBody {
 	return &fwkrh.InferenceRequestBody{
-		TokenizedPrompt: &fwkrh.TokenizedPrompt{TokenIDs: tokenIDs},
+		TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{tokenIDs}},
 	}
 }
 
@@ -68,8 +69,8 @@ func TestProduce(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, p.PluginState())
 
-	endpoint1 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod1"}}, fwkdl.NewMetrics(), fwkdl.NewAttributes())
-	endpoint2 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod2"}}, fwkdl.NewMetrics(), fwkdl.NewAttributes())
+	endpoint1 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod1"}}, fwkdl.NewMetrics(), fwkdl.NewAttributes())
+	endpoint2 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod2"}}, fwkdl.NewMetrics(), fwkdl.NewAttributes())
 	endpoints := []fwksched.Endpoint{endpoint1, endpoint2}
 
 	// First request to populate cache.
@@ -88,7 +89,7 @@ func TestProduce(t *testing.T) {
 	state, err := plugin.ReadPluginStateKey[*SchedulingContextState](p.PluginState(), req1.RequestID, plugin.StateKey(ApproxPrefixCachePluginType))
 	assert.NoError(t, err)
 	assert.NotNil(t, state)
-	assert.Equal(t, 2, len(state.PrefixHashes)) // 2 token IDs at blockSize 1 -> 2 blocks
+	assert.Equal(t, 2, len(state.PerPromptHashes[0])) // 2 token IDs at blockSize 1 -> 2 blocks
 
 	// Verify pod match info was set (should be 0 match since indexer is empty)
 	key := attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(ApproxPrefixCachePluginType).String()
@@ -111,7 +112,7 @@ func TestPreRequest(t *testing.T) {
 		}
 		p, _ := newDataProducer(context.Background(), ApproxPrefixCachePluginType, config, testHandle())
 
-		endpoint1 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod1", Namespace: "default"}}, fwkdl.NewMetrics(), fwkdl.NewAttributes())
+		endpoint1 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod1", Namespace: "default"}}, fwkdl.NewMetrics(), fwkdl.NewAttributes())
 		req1 := &fwksched.InferenceRequest{
 			RequestID:   uuid.NewString(),
 			TargetModel: "test-model1",
@@ -138,10 +139,12 @@ func TestPreRequest(t *testing.T) {
 		p.wg.Wait()
 
 		// 4. Verify indexer was updated
-		hashes := getBlockHashes(context.Background(), req1, config.BlockSizeTokens, defaultMaxPrefixBlocks)
-		for _, hash := range hashes {
-			pods := p.indexer().Get(hash)
-			assert.Contains(t, pods, ServerID(endpoint1.GetMetadata().NamespacedName))
+		perPromptHashes := prefixhash.GetBlockHashes(context.Background(), req1, config.BlockSizeTokens, defaultMaxPrefixBlocks)
+		for _, promptHashes := range perPromptHashes {
+			for _, hash := range promptHashes {
+				pods := p.indexer().Get(hash)
+				assert.Contains(t, pods, ServerID(endpoint1.GetMetadata().ID))
+			}
 		}
 	})
 
@@ -154,7 +157,7 @@ func TestPreRequest(t *testing.T) {
 		}
 		p, _ := newDataProducer(context.Background(), ApproxPrefixCachePluginType, config, testHandle())
 
-		endpoint1 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod1", Namespace: "default"}}, fwkdl.NewMetrics(), fwkdl.NewAttributes())
+		endpoint1 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod1", Namespace: "default"}}, fwkdl.NewMetrics(), fwkdl.NewAttributes())
 
 		// Three requests with distinct token IDs generate distinct hashes.
 		// BlockSizeTokens is 1, so each single-token request yields one block.
@@ -180,8 +183,8 @@ func TestPreRequest(t *testing.T) {
 			p.PreRequest(context.Background(), req, res)
 			p.wg.Wait()
 
-			hashes := getBlockHashes(context.Background(), req, config.BlockSizeTokens, defaultMaxPrefixBlocks)
-			allHashes = append(allHashes, hashes)
+			perPromptHashes := prefixhash.GetBlockHashes(context.Background(), req, config.BlockSizeTokens, defaultMaxPrefixBlocks)
+			allHashes = append(allHashes, perPromptHashes[0])
 		}
 
 		// Since capacity is 2, the first request's hash should have been evicted.
@@ -232,9 +235,9 @@ func TestPrefixPluginPartialPrefixMatch(t *testing.T) {
 	}
 	p, _ := newDataProducer(context.Background(), ApproxPrefixCachePluginType, config, testHandle())
 
-	endpoint1 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod1"}}, fwkdl.NewMetrics(), fwkdl.NewAttributes())
-	endpoint2 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod2"}}, fwkdl.NewMetrics(), fwkdl.NewAttributes())
-	endpoint3 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod3"}}, fwkdl.NewMetrics(), fwkdl.NewAttributes())
+	endpoint1 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod1"}}, fwkdl.NewMetrics(), fwkdl.NewAttributes())
+	endpoint2 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod2"}}, fwkdl.NewMetrics(), fwkdl.NewAttributes())
+	endpoint3 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod3"}}, fwkdl.NewMetrics(), fwkdl.NewAttributes())
 	endpoints := []fwksched.Endpoint{endpoint1, endpoint2, endpoint3}
 
 	// First request: tokens [1, 2].
@@ -245,7 +248,7 @@ func TestPrefixPluginPartialPrefixMatch(t *testing.T) {
 	}
 	_ = p.Produce(context.Background(), req1, endpoints)
 	state, _ := plugin.ReadPluginStateKey[*SchedulingContextState](p.PluginState(), req1.RequestID, plugin.StateKey(ApproxPrefixCachePluginType))
-	assert.Equal(t, 2, len(state.PrefixHashes))
+	assert.Equal(t, 2, len(state.PerPromptHashes[0]))
 
 	// Simulate pod1 was picked and pod3 was picked as a prefill node.
 	schedulingResult := &fwksched.SchedulingResult{
@@ -294,7 +297,7 @@ func TestPrefixPluginPrefixGrowth(t *testing.T) {
 	}
 	p, _ := newDataProducer(context.Background(), ApproxPrefixCachePluginType, config, testHandle())
 
-	endpoint1 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod1"}}, &fwkdl.Metrics{}, fwkdl.NewAttributes())
+	endpoint1 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod1"}}, &fwkdl.Metrics{}, fwkdl.NewAttributes())
 	endpoints := []fwksched.Endpoint{endpoint1}
 
 	// First request with an initial token prefix.
@@ -305,7 +308,7 @@ func TestPrefixPluginPrefixGrowth(t *testing.T) {
 	}
 	_ = p.Produce(context.Background(), req1, endpoints)
 	state1, _ := plugin.ReadPluginStateKey[*SchedulingContextState](p.PluginState(), req1.RequestID, plugin.StateKey(ApproxPrefixCachePluginType))
-	initialHashCount := len(state1.PrefixHashes)
+	initialHashCount := len(state1.PerPromptHashes[0])
 	assert.Greater(t, initialHashCount, 0)
 
 	// Simulate pod1 was picked
@@ -326,7 +329,7 @@ func TestPrefixPluginPrefixGrowth(t *testing.T) {
 	}
 	_ = p.Produce(context.Background(), req2, endpoints)
 	state2, _ := plugin.ReadPluginStateKey[*SchedulingContextState](p.PluginState(), req2.RequestID, plugin.StateKey(ApproxPrefixCachePluginType))
-	extendedHashCount := len(state2.PrefixHashes)
+	extendedHashCount := len(state2.PerPromptHashes[0])
 	assert.Greater(t, extendedHashCount, initialHashCount)
 
 	key := attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(ApproxPrefixCachePluginType).String()
@@ -338,7 +341,7 @@ func TestPrefixPluginPrefixGrowth(t *testing.T) {
 
 func TestPrefixPluginAutoTune(t *testing.T) {
 	podName := "pod-autotune"
-	endpoint := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: podName}},
+	endpoint := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: podName}},
 		&fwkdl.Metrics{
 			// Pod reports a block size above minBlockSizeTokens so the autotune
 			// path passes the metric through unclamped. (Metric values below the
@@ -370,7 +373,7 @@ func TestPrefixPluginAutoTune(t *testing.T) {
 	_ = p.Produce(context.Background(), req, endpoints)
 	state, _ := plugin.ReadPluginStateKey[*SchedulingContextState](p.PluginState(), req.RequestID, plugin.StateKey(ApproxPrefixCachePluginType))
 	// 192 tokens / 128 tokens per block = 2 blocks.
-	assert.Equal(t, 2, len(state.PrefixHashes), "Should use pod block size (128 tokens) -> 2 blocks")
+	assert.Equal(t, 2, len(state.PerPromptHashes[0]), "Should use pod block size (128 tokens) -> 2 blocks")
 
 	schedulingResult := &fwksched.SchedulingResult{
 		PrimaryProfileName: "default",
@@ -382,7 +385,7 @@ func TestPrefixPluginAutoTune(t *testing.T) {
 	p.wg.Wait()
 
 	// Check indexer state - should be in tracked pods
-	assert.Contains(t, p.indexer().Pods(), ServerID(endpoint.GetMetadata().NamespacedName))
+	assert.Contains(t, p.indexer().Pods(), ServerID(endpoint.GetMetadata().ID))
 }
 
 func TestMaxPrefixTokensToMatch(t *testing.T) {
@@ -398,7 +401,7 @@ func TestMaxPrefixTokensToMatch(t *testing.T) {
 	assert.NoError(t, err)
 
 	endpoint := fwksched.NewEndpoint(
-		&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod1"}},
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod1"}},
 		fwkdl.NewMetrics(), fwkdl.NewAttributes(),
 	)
 
@@ -414,7 +417,7 @@ func TestMaxPrefixTokensToMatch(t *testing.T) {
 
 	state, err := plugin.ReadPluginStateKey[*SchedulingContextState](p.PluginState(), req.RequestID, plugin.StateKey(ApproxPrefixCachePluginType))
 	assert.NoError(t, err)
-	assert.Equal(t, 2, len(state.PrefixHashes), "should cap at MaxPrefixTokensToMatch/BlockSizeTokens = 2 blocks")
+	assert.Equal(t, 2, len(state.PerPromptHashes[0]), "should cap at MaxPrefixTokensToMatch/BlockSizeTokens = 2 blocks")
 
 	// When MaxPrefixTokensToMatch is 0 (unset), fall back to MaxPrefixBlocksToMatch.
 	cfg2 := config{
@@ -437,7 +440,41 @@ func TestMaxPrefixTokensToMatch(t *testing.T) {
 
 	state2, err := plugin.ReadPluginStateKey[*SchedulingContextState](p2.PluginState(), req2.RequestID, plugin.StateKey(ApproxPrefixCachePluginType))
 	assert.NoError(t, err)
-	assert.Equal(t, 3, len(state2.PrefixHashes), "should fall back to MaxPrefixBlocksToMatch when MaxPrefixTokensToMatch is 0")
+	assert.Equal(t, 3, len(state2.PerPromptHashes[0]), "should fall back to MaxPrefixBlocksToMatch when MaxPrefixTokensToMatch is 0")
+}
+
+// TestMaxPrefixBothCapsZeroMatchesEverything verifies that zeroing both caps
+// hashes the whole prompt rather than nothing. The prompt length is already
+// bounded by the model server's context window, so an absent cap is an implicit
+// max_model_len cap.
+func TestMaxPrefixBothCapsZeroMatchesEverything(t *testing.T) {
+	disableMinBlockSizeClamp(t)
+	cfg := config{
+		BlockSizeTokens:        1,
+		MaxPrefixTokensToMatch: 0,
+		MaxPrefixBlocksToMatch: 0,
+		LRUCapacityPerServer:   defaultLRUCapacityPerServer,
+	}
+	p, err := newDataProducer(context.Background(), ApproxPrefixCachePluginType, cfg, testHandle())
+	assert.NoError(t, err)
+
+	endpoint := fwksched.NewEndpoint(
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod1"}},
+		fwkdl.NewMetrics(), fwkdl.NewAttributes(),
+	)
+
+	req := &fwksched.InferenceRequest{
+		RequestID:   uuid.NewString(),
+		TargetModel: "test-model",
+		Body:        tokenizedBody([]uint32{1, 2, 3, 4}),
+	}
+
+	err = p.Produce(context.Background(), req, []fwksched.Endpoint{endpoint})
+	assert.NoError(t, err)
+
+	state, err := plugin.ReadPluginStateKey[*SchedulingContextState](p.PluginState(), req.RequestID, plugin.StateKey(ApproxPrefixCachePluginType))
+	assert.NoError(t, err)
+	assert.Equal(t, 4, len(state.PerPromptHashes[0]), "both caps at 0 should hash every block in the prompt")
 }
 
 // TestGetBlockSize_AutotuneClampsBelowMinimum verifies that when AutoTune is on and
@@ -452,7 +489,7 @@ func TestGetBlockSize_AutotuneClampsBelowMinimum(t *testing.T) {
 	assert.NoError(t, err)
 
 	endpoint := fwksched.NewEndpoint(
-		&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod1"}},
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod1"}},
 		&fwkdl.Metrics{CacheBlockSize: 16}, // model server uses small blocks
 		fwkdl.NewAttributes(),
 	)
@@ -470,7 +507,7 @@ func TestGetBlockSize_AutotuneAboveMinimumPassesThrough(t *testing.T) {
 	assert.NoError(t, err)
 
 	endpoint := fwksched.NewEndpoint(
-		&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod1"}},
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod1"}},
 		&fwkdl.Metrics{CacheBlockSize: 128},
 		fwkdl.NewAttributes(),
 	)
@@ -540,7 +577,7 @@ func BenchmarkPrefixPluginStress(b *testing.B) {
 				tokenIDs[i] = uint32(i)
 			}
 			endpoint := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{
-				NamespacedName: k8stypes.NamespacedName{Name: "pod1"},
+				ID: k8stypes.NamespacedName{Name: "pod1"},
 			}, nil, fwkdl.NewAttributes())
 			endpoints := []fwksched.Endpoint{endpoint}
 			req := &fwksched.InferenceRequest{
@@ -606,6 +643,155 @@ func TestFactory_DeprecatedBlockSizeMapped(t *testing.T) {
 		"deprecated 'blockSize' should be cleared after mapping")
 }
 
+func TestProduce_MultiPrompt(t *testing.T) {
+	disableMinBlockSizeClamp(t)
+	cfg := config{
+		BlockSizeTokens:        1,
+		MaxPrefixBlocksToMatch: defaultMaxPrefixBlocks,
+		LRUCapacityPerServer:   defaultLRUCapacityPerServer,
+	}
+	p, err := newDataProducer(context.Background(), ApproxPrefixCachePluginType, cfg, testHandle())
+	assert.NoError(t, err)
+
+	endpoint := fwksched.NewEndpoint(
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod1"}},
+		fwkdl.NewMetrics(), fwkdl.NewAttributes(),
+	)
+	endpoints := []fwksched.Endpoint{endpoint}
+
+	req := &fwksched.InferenceRequest{
+		RequestID:   uuid.NewString(),
+		TargetModel: "test-model",
+		Body: &fwkrh.InferenceRequestBody{
+			TokenizedPrompt: &fwkrh.TokenizedPrompt{
+				PerPromptTokens: [][]uint32{{1, 2, 3}, {4, 5}},
+			},
+		},
+	}
+
+	err = p.Produce(context.Background(), req, endpoints)
+	assert.NoError(t, err)
+
+	state, err := plugin.ReadPluginStateKey[*SchedulingContextState](p.PluginState(), req.RequestID, plugin.StateKey(ApproxPrefixCachePluginType))
+	assert.NoError(t, err)
+	assert.Equal(t, 2, len(state.PerPromptHashes), "should have hashes for 2 prompts")
+	assert.Equal(t, 3, len(state.PerPromptHashes[0]), "first prompt: 3 tokens at blockSize 1")
+	assert.Equal(t, 2, len(state.PerPromptHashes[1]), "second prompt: 2 tokens at blockSize 1")
+
+	key := attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(ApproxPrefixCachePluginType).String()
+	info, ok := endpoint.Get(key)
+	assert.True(t, ok)
+	prefixInfo := info.(*attrprefix.PrefixCacheMatchInfo)
+	assert.Equal(t, 0, prefixInfo.MatchBlocks(), "empty indexer -> no match")
+	assert.Equal(t, 5, prefixInfo.TotalBlocks(), "total blocks = 3 + 2")
+}
+
+func TestMultiPromptMatchAggregation(t *testing.T) {
+	disableMinBlockSizeClamp(t)
+	cfg := config{
+		BlockSizeTokens:        1,
+		MaxPrefixBlocksToMatch: defaultMaxPrefixBlocks,
+		LRUCapacityPerServer:   defaultLRUCapacityPerServer,
+	}
+	p, _ := newDataProducer(context.Background(), ApproxPrefixCachePluginType, cfg, testHandle())
+
+	endpoint := fwksched.NewEndpoint(
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod1", Namespace: "default"}},
+		fwkdl.NewMetrics(), fwkdl.NewAttributes(),
+	)
+	endpoints := []fwksched.Endpoint{endpoint}
+
+	// Seed the indexer with a multi-prompt request.
+	req1 := &fwksched.InferenceRequest{
+		RequestID:   uuid.NewString(),
+		TargetModel: "test-model",
+		Body: &fwkrh.InferenceRequestBody{
+			TokenizedPrompt: &fwkrh.TokenizedPrompt{
+				PerPromptTokens: [][]uint32{{1, 2, 3}, {4, 5}},
+			},
+		},
+	}
+	_ = p.Produce(context.Background(), req1, endpoints)
+	p.PreRequest(context.Background(), req1, &fwksched.SchedulingResult{
+		PrimaryProfileName: "default",
+		ProfileResults: map[string]*fwksched.ProfileRunResult{
+			"default": {TargetEndpoints: endpoints},
+		},
+	})
+	p.wg.Wait()
+
+	// Second request with the same two prompts — all blocks should match.
+	req2 := &fwksched.InferenceRequest{
+		RequestID:   uuid.NewString(),
+		TargetModel: "test-model",
+		Body: &fwkrh.InferenceRequestBody{
+			TokenizedPrompt: &fwkrh.TokenizedPrompt{
+				PerPromptTokens: [][]uint32{{1, 2, 3}, {4, 5}},
+			},
+		},
+	}
+	_ = p.Produce(context.Background(), req2, endpoints)
+
+	key := attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(ApproxPrefixCachePluginType).String()
+	info, _ := endpoint.Get(key)
+	prefixInfo := info.(*attrprefix.PrefixCacheMatchInfo)
+	assert.Equal(t, 5, prefixInfo.MatchBlocks(), "all 5 blocks (3+2) should match")
+	assert.Equal(t, 5, prefixInfo.TotalBlocks())
+}
+
+func TestMultiPromptPartialMatch(t *testing.T) {
+	disableMinBlockSizeClamp(t)
+	cfg := config{
+		BlockSizeTokens:        1,
+		MaxPrefixBlocksToMatch: defaultMaxPrefixBlocks,
+		LRUCapacityPerServer:   defaultLRUCapacityPerServer,
+	}
+	p, _ := newDataProducer(context.Background(), ApproxPrefixCachePluginType, cfg, testHandle())
+
+	endpoint := fwksched.NewEndpoint(
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod1", Namespace: "default"}},
+		fwkdl.NewMetrics(), fwkdl.NewAttributes(),
+	)
+	endpoints := []fwksched.Endpoint{endpoint}
+
+	// Seed with two prompts: [1,2] and [3,4].
+	req1 := &fwksched.InferenceRequest{
+		RequestID:   uuid.NewString(),
+		TargetModel: "test-model",
+		Body: &fwkrh.InferenceRequestBody{
+			TokenizedPrompt: &fwkrh.TokenizedPrompt{
+				PerPromptTokens: [][]uint32{{1, 2}, {3, 4}},
+			},
+		},
+	}
+	_ = p.Produce(context.Background(), req1, endpoints)
+	p.PreRequest(context.Background(), req1, &fwksched.SchedulingResult{
+		PrimaryProfileName: "default",
+		ProfileResults: map[string]*fwksched.ProfileRunResult{
+			"default": {TargetEndpoints: endpoints},
+		},
+	})
+	p.wg.Wait()
+
+	// Query with [1,2] (matches) and [5,6] (no match).
+	req2 := &fwksched.InferenceRequest{
+		RequestID:   uuid.NewString(),
+		TargetModel: "test-model",
+		Body: &fwkrh.InferenceRequestBody{
+			TokenizedPrompt: &fwkrh.TokenizedPrompt{
+				PerPromptTokens: [][]uint32{{1, 2}, {5, 6}},
+			},
+		},
+	}
+	_ = p.Produce(context.Background(), req2, endpoints)
+
+	key := attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(ApproxPrefixCachePluginType).String()
+	info, _ := endpoint.Get(key)
+	prefixInfo := info.(*attrprefix.PrefixCacheMatchInfo)
+	assert.Equal(t, 2, prefixInfo.MatchBlocks(), "only first prompt's 2 blocks should match")
+	assert.Equal(t, 4, prefixInfo.TotalBlocks(), "total blocks = 2 + 2")
+}
+
 func TestPrefixPluginTokenizedRequest(t *testing.T) {
 	disableMinBlockSizeClamp(t)
 	cfg := config{
@@ -617,7 +803,7 @@ func TestPrefixPluginTokenizedRequest(t *testing.T) {
 	assert.NoError(t, err)
 
 	endpoint := fwksched.NewEndpoint(
-		&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod1"}},
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod1"}},
 		fwkdl.NewMetrics(), fwkdl.NewAttributes(),
 	)
 	endpoints := []fwksched.Endpoint{endpoint}
@@ -635,7 +821,7 @@ func TestPrefixPluginTokenizedRequest(t *testing.T) {
 	state, err := plugin.ReadPluginStateKey[*SchedulingContextState](p.PluginState(), req.RequestID, plugin.StateKey(ApproxPrefixCachePluginType))
 	assert.NoError(t, err)
 	assert.NotNil(t, state)
-	assert.Equal(t, 4, len(state.PrefixHashes))
+	assert.Equal(t, 4, len(state.PerPromptHashes[0]))
 
 	// Verify match info was set on the endpoint (0 match since indexer is empty).
 	key := attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(ApproxPrefixCachePluginType).String()
@@ -655,7 +841,7 @@ func TestPrefixPluginMatchesSameTokens(t *testing.T) {
 	p, _ := newDataProducer(context.Background(), ApproxPrefixCachePluginType, cfg, testHandle())
 
 	endpoint := fwksched.NewEndpoint(
-		&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod1", Namespace: "default"}},
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod1", Namespace: "default"}},
 		fwkdl.NewMetrics(), fwkdl.NewAttributes(),
 	)
 	endpoints := []fwksched.Endpoint{endpoint}
@@ -679,5 +865,80 @@ func TestPrefixPluginMatchesSameTokens(t *testing.T) {
 	_ = p.Produce(context.Background(), req2, endpoints)
 	state2, _ := plugin.ReadPluginStateKey[*SchedulingContextState](p.PluginState(), req2.RequestID, plugin.StateKey(ApproxPrefixCachePluginType))
 
-	assert.Equal(t, state1.PrefixHashes, state2.PrefixHashes, "identical token IDs must produce identical hashes")
+	assert.Equal(t, state1.PerPromptHashes, state2.PerPromptHashes, "identical token IDs must produce identical hashes")
+}
+
+func TestDumpState(t *testing.T) {
+	idx := newIndexer(context.Background(), 100, "test-name", "test-type")
+	podA := server{ServerID: ServerID{Namespace: "ns", Name: "pod-a"}}
+	podB := server{ServerID: ServerID{Namespace: "ns", Name: "pod-b"}}
+	idx.Add([]blockHash{1001, 1002, 1003}, podA)
+	idx.Add([]blockHash{2001, 2002}, podB)
+
+	p := &dataProducer{indexerInst: idx}
+	payload, err := p.DumpState()
+	assert.NoError(t, err)
+	// Block hashes are derived from prompt content and must never reach the dump.
+	assert.NotContains(t, string(payload), "1001")
+
+	var got prefixIndexState
+	assert.NoError(t, json.Unmarshal(payload, &got))
+	assert.Equal(t, prefixIndexState{
+		Pods: []podBlockCount{
+			{Pod: "ns/pod-a", Blocks: 3},
+			{Pod: "ns/pod-b", Blocks: 2},
+		},
+		TotalPods: 2,
+		MaxPods:   maxDebugDumpPods,
+	}, got)
+}
+
+func TestDumpStateCapsPods(t *testing.T) {
+	idx := newIndexer(context.Background(), 1000, "test-name", "test-type")
+	const extra = 5
+	for i := 0; i < maxDebugDumpPods+extra; i++ {
+		pod := server{ServerID: ServerID{Namespace: "ns", Name: fmt.Sprintf("pod-%03d", i)}}
+		hashes := make([]blockHash, i+1)
+		for j := range hashes {
+			hashes[j] = blockHash(i*1000 + j)
+		}
+		idx.Add(hashes, pod)
+	}
+
+	p := &dataProducer{indexerInst: idx}
+	payload, err := p.DumpState()
+	assert.NoError(t, err)
+
+	var got prefixIndexState
+	assert.NoError(t, json.Unmarshal(payload, &got))
+	// The dump is partial: TotalPods exceeds the returned count, capped at MaxPods.
+	assert.Equal(t, maxDebugDumpPods+extra, got.TotalPods)
+	assert.Greater(t, got.TotalPods, got.MaxPods)
+	assert.Len(t, got.Pods, maxDebugDumpPods)
+	// The pod holding the most blocks is listed first.
+	assert.Equal(t, "ns/pod-104", got.Pods[0].Pod)
+	assert.Equal(t, maxDebugDumpPods+extra, got.Pods[0].Blocks)
+}
+
+func TestDumpStateEmpty(t *testing.T) {
+	// A nil indexer should still produce valid JSON instead of panicking.
+	p := &dataProducer{}
+	payload, err := p.DumpState()
+	assert.NoError(t, err)
+	assert.True(t, json.Valid(payload))
+
+	var got prefixIndexState
+	assert.NoError(t, json.Unmarshal(payload, &got))
+	assert.Empty(t, got.Pods)
+	assert.Equal(t, maxDebugDumpPods, got.MaxPods)
+
+	// A live indexer with nothing tracked yet reports zero pods.
+	p.indexerInst = newIndexer(context.Background(), 100, "test-name", "test-type")
+	payload, err = p.DumpState()
+	assert.NoError(t, err)
+
+	got = prefixIndexState{}
+	assert.NoError(t, json.Unmarshal(payload, &got))
+	assert.Equal(t, 0, got.TotalPods)
+	assert.Empty(t, got.Pods)
 }

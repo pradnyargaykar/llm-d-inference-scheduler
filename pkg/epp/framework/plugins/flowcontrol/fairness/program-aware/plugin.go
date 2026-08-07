@@ -1,3 +1,19 @@
+/*
+Copyright 2026 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 // Package programaware implements a flow-control fairness policy that schedules
 // programs using their accumulated metrics using scoring strategies (LAS, DRR, or RR).
 package programaware
@@ -12,6 +28,8 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
+	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 )
 
 // ProgramAwarePluginType is the registered type name for this plugin.
@@ -27,91 +45,33 @@ const enqueueTimeAttributeKey = "program-aware/enqueue-time"
 type Config struct {
 	// Strategy selects the fairness scoring algorithm used by Pick().
 	// Valid values: "las" (default), "drr", "rr".
-	//
-	//   "las"    — attained service fairness: tracks time-decayed weighted tokens
-	//              consumed per program. Programs with lower attained service are
-	//              promoted. Directly targets fair resource allocation.
-	//
-	//   "drr"    — Deficit Round Robin adapted for tokens [Shreedhar & Varghese 1995].
-	//              Each round every active queue earns a token quantum; actual token
-	//              usage is deducted at response completion. Provides provably
-	//              proportional fairness independent of request rate or size.
-	//
-	//   "rr"     — Simple round-robin: cycles through program queues in sorted order,
-	//              skipping empty queues. Matches the upstream round-robin fairness
-	//              policy. No token or service tracking.
-	Strategy string `json:"strategy"`
+	Strategy string `json:"strategy,omitempty"`
 
 	// --- DRR weights (only used when strategy == "drr") ---
-
-	// WeightDeficit is the weight for the deficit counter signal.
-	WeightDeficit float64 `json:"weightDeficit,omitempty"`
-
-	// WeightDRRHeadWait is the weight for head-of-queue age in DRR.
-	WeightDRRHeadWait float64 `json:"weightDrrHeadWait,omitempty"`
-
-	// QuantumTokens is the token budget added to each non-empty queue per Pick() cycle.
-	QuantumTokens int64 `json:"quantumTokens,omitempty"`
-
-	// DeficitHalfLifeSeconds is the half-life of the DRR deficit counter.
-	// Deficit decays to 50% after this duration. 0 disables time-based decay
-	// (DeficitDecayFactor takes over). When > 0, this takes precedence over
-	// DeficitDecayFactor.
+	WeightDeficit          float64 `json:"weightDeficit,omitempty"`
+	WeightDRRHeadWait      float64 `json:"weightDrrHeadWait,omitempty"`
+	QuantumTokens          int64   `json:"quantumTokens,omitempty"`
 	DeficitHalfLifeSeconds float64 `json:"deficitHalfLifeSeconds,omitempty"`
-
-	// DeficitDecayFactor is the per-Pick factor decay for the DRR deficit
-	// counter when DeficitHalfLifeSeconds is 0. Each Pick() multiplies the
-	// deficit of inactive queues (Len==0 and no in-flight requests) by this
-	// factor. Must be in [0, 1); 0 disables factor decay.
-	//
-	// Because decay fires per Pick(), the effective half-life depends on the
-	// cluster's pick rate — at low pick rates an idle program may retain most
-	// of its deficit through the eviction TTL. Prefer DeficitHalfLifeSeconds
-	// when predictable wall-clock decay is required.
-	DeficitDecayFactor float64 `json:"deficitDecayFactor,omitempty"`
+	DeficitDecayFactor     float64 `json:"deficitDecayFactor,omitempty"`
 
 	// --- Service weights (only used when strategy == "las") ---
-
-	// WeightService is the weight for the inverted attained service signal.
-	// Programs with lower attained service score higher.
-	WeightService float64 `json:"weightService,omitempty"`
-
-	// WeightServiceHeadWait is the weight for head-of-queue age in service strategy.
-	// Acts as a tiebreaker for cold start.
-	WeightServiceHeadWait float64 `json:"weightServiceHeadWait,omitempty"`
-
-	// ServiceDecayFactor controls how quickly old service is forgotten.
-	// Applied to each program's attained service every Pick() cycle.
-	// Higher values (closer to 1.0) = longer memory. Must be in (0, 1].
-	// Ignored when ServiceHalfLifeSeconds is set.
-	//
-	// Because decay fires per Pick(), the effective half-life depends on the
-	// cluster's pick rate — at low pick rates an idle program may retain most
-	// of its attained service through the eviction TTL. Prefer
-	// ServiceHalfLifeSeconds when predictable wall-clock decay is required.
-	ServiceDecayFactor float64 `json:"serviceDecayFactor,omitempty"`
-
-	// ServiceHalfLifeSeconds is the half-life of the LAS attained-service
-	// counter when set (> 0); overrides ServiceDecayFactor with wall-clock
-	// based decay. Service decays to 50% after this duration.
+	WeightService          float64 `json:"weightService,omitempty"`
+	WeightServiceHeadWait  float64 `json:"weightServiceHeadWait,omitempty"`
+	ServiceDecayFactor     float64 `json:"serviceDecayFactor,omitempty"`
 	ServiceHalfLifeSeconds float64 `json:"serviceHalfLifeSeconds,omitempty"`
 
+	// Compatibility aliases for LAS
+	LASWeightService   float64 `json:"lasWeightService,omitempty"`
+	LASWeightHeadWait  float64 `json:"lasWeightHeadWait,omitempty"`
+	LASDecayFactor     float64 `json:"lasDecayFactor,omitempty"`
+	LASHalfLifeSeconds float64 `json:"lasHalfLifeSeconds,omitempty"`
+
 	// --- Eviction (applies to all strategies) ---
-
-	// EvictionTTLSeconds bounds the lifetime of per-program metrics.
-	// A program with no completed requests in this window is evicted from
-	// the metrics map. Set to 0 to disable eviction (unbounded growth).
-	EvictionTTLSeconds float64 `json:"evictionTtlSeconds,omitempty"`
-
-	// EvictionSweepSeconds is how often the eviction sweep runs.
-	// Must be > 0 when EvictionTTLSeconds > 0.
+	EvictionTTLSeconds   float64 `json:"evictionTtlSeconds,omitempty"`
 	EvictionSweepSeconds float64 `json:"evictionSweepSeconds,omitempty"`
 }
 
-// DefaultConfig returns the canonical Config used when JSON parameters are
-// absent or partial. Returned by value so callers cannot mutate a shared
-// default through the package, ensuring defaults stay stable over the
-// plugin's lifetime.
+// DefaultConfig returns the canonical Config used when JSON parameters are absent or partial.
 func DefaultConfig() Config {
 	return Config{
 		Strategy:               "las",
@@ -129,9 +89,7 @@ func DefaultConfig() Config {
 	}
 }
 
-// validate checks that numeric fields fall in the ranges the scoring
-// strategies assume. Defaults from DefaultConfig already satisfy every rule;
-// validation only catches user overrides that fall outside the safe range.
+// validate checks that numeric fields fall in safe ranges.
 func (c Config) validate() error {
 	if c.WeightDeficit < 0 {
 		return fmt.Errorf("weightDeficit must be >= 0, got %v", c.WeightDeficit)
@@ -175,15 +133,11 @@ var (
 	_ fwkrc.DataProducer          = &ProgramAwarePlugin{}
 	_ fwkrc.PreRequest            = &ProgramAwarePlugin{}
 	_ fwkrc.ResponseBodyProcessor = &ProgramAwarePlugin{}
+	_ plugin.StateDumper          = &ProgramAwarePlugin{}
 )
 
 // ProgramAwarePluginFactory creates a new ProgramAwarePlugin from JSON config.
-// Example config: {"strategy": "drr"}
-//
-// The qualified name matches sibling fairness factories
-// (roundrobin.RoundRobinFairnessPolicyFactory, globalstrict.GlobalStrictFairnessPolicyFactory).
-//
-//nolint:revive // factory name matches sibling fairness plugins; see comment above.
+//nolint:revive
 func ProgramAwarePluginFactory(name string, parameters *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
 	cfg := DefaultConfig()
 	if parameters != nil {
@@ -191,6 +145,21 @@ func ProgramAwarePluginFactory(name string, parameters *json.Decoder, handle plu
 			return nil, fmt.Errorf("invalid config for %s plugin %q: %w", ProgramAwarePluginType, name, err)
 		}
 	}
+
+	// Reconcile compatibility alias fields if supplied
+	if cfg.LASWeightService > 0 {
+		cfg.WeightService = cfg.LASWeightService
+	}
+	if cfg.LASWeightHeadWait > 0 {
+		cfg.WeightServiceHeadWait = cfg.LASWeightHeadWait
+	}
+	if cfg.LASDecayFactor > 0 {
+		cfg.ServiceDecayFactor = cfg.LASDecayFactor
+	}
+	if cfg.LASHalfLifeSeconds > 0 {
+		cfg.ServiceHalfLifeSeconds = cfg.LASHalfLifeSeconds
+	}
+
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("%s plugin %q: %w", ProgramAwarePluginType, name, err)
 	}
@@ -202,8 +171,6 @@ func ProgramAwarePluginFactory(name string, parameters *json.Decoder, handle plu
 		name:     name,
 		strategy: strategy,
 	}
-	// Register Prometheus collectors via the framework's recorder.
-	// Both handle and handle.Metrics() may be nil in test paths.
 	if handle != nil {
 		if reg := handle.Metrics(); reg != nil {
 			for _, c := range GetCollectors() {
@@ -224,10 +191,6 @@ func ProgramAwarePluginFactory(name string, parameters *json.Decoder, handle plu
 
 // ProgramAwarePlugin implements a FairnessPolicy that selects which program's
 // queue to service next, and request lifecycle hooks that track per-program metrics.
-//
-// Fairness behaviour is determined by the configured ScoringStrategy (default: LAS).
-// Program identity comes from the x-gateway-inference-fairness-id request header.
-//
 //nolint:revive
 type ProgramAwarePlugin struct {
 	name     string
@@ -246,9 +209,39 @@ func (p *ProgramAwarePlugin) TypedName() plugin.TypedName {
 	}
 }
 
-// getStrategy returns the configured strategy, falling back to a strategy
-// built from DefaultConfig for zero-value plugin instances constructed
-// directly in tests. DefaultConfig is known-valid so newStrategy cannot fail.
+type fairnessDumpState struct {
+	TotalPrograms int     `json:"totalPrograms"`
+	TotalInFlight int64   `json:"totalInFlight"`
+	FairnessIndex float64 `json:"fairnessIndex"`
+}
+
+// DumpState reports aggregate fairness health.
+func (p *ProgramAwarePlugin) DumpState() (json.RawMessage, error) {
+	var totalPrograms int
+	var totalInFlight int64
+	var sum, sumSq, n float64
+	p.programMetrics.Range(func(_, value any) bool {
+		totalPrograms++
+		m, ok := value.(*ProgramMetrics)
+		if !ok {
+			return true
+		}
+		totalInFlight += m.InFlight()
+		if m.WaitCount() > 0 {
+			x := m.AverageWaitTime()
+			sum += x
+			sumSq += x * x
+			n++
+		}
+		return true
+	})
+	return json.Marshal(fairnessDumpState{
+		TotalPrograms: totalPrograms,
+		TotalInFlight: totalInFlight,
+		FairnessIndex: jainFairnessIndex(sum, sumSq, n),
+	})
+}
+
 func (p *ProgramAwarePlugin) getStrategy() ScoringStrategy {
 	if p.strategy == nil {
 		s, _ := newStrategy(DefaultConfig())
@@ -257,32 +250,50 @@ func (p *ProgramAwarePlugin) getStrategy() ScoringStrategy {
 	return p.strategy
 }
 
-// --- FairnessPolicy interface ---
+func (p *ProgramAwarePlugin) getOrCreateMetrics(programID string) *ProgramMetrics {
+	if metricsRaw, ok := p.programMetrics.Load(programID); ok {
+		if m, ok := metricsRaw.(*ProgramMetrics); ok {
+			return m
+		}
+	}
+	fresh := &ProgramMetrics{lastCompletionTime: time.Now()}
+	actual, _ := p.programMetrics.LoadOrStore(programID, fresh)
+	if existing, ok := actual.(*ProgramMetrics); ok {
+		return existing
+	}
+	p.programMetrics.Store(programID, fresh)
+	return fresh
+}
 
-// NewState creates per-PriorityBand state. This plugin uses its own sync.Map
-// for all state, so no per-band state is needed.
+func programIDFor(req *fwksched.InferenceRequest) string {
+	if req == nil || req.FairnessID == "" {
+		return metadata.DefaultFairnessID
+	}
+	return req.FairnessID
+}
+
+// NewState creates per-PriorityBand state.
 func (p *ProgramAwarePlugin) NewState(_ context.Context) any {
 	return nil
 }
 
 // Pick selects which program queue to service next by delegating to the
-// configured ScoringStrategy. The strategy receives all queues and returns
-// the selected queue plus per-queue scores for observability.
+// configured ScoringStrategy.
 func (p *ProgramAwarePlugin) Pick(_ context.Context, band flowcontrol.PriorityBandAccessor) (flowcontrol.FlowQueueAccessor, error) {
+	if band == nil {
+		return nil, nil //nolint:nilnil
+	}
+
 	start := time.Now()
 	defer func() {
 		pickLatencyUs.Observe(float64(time.Since(start).Microseconds()))
 	}()
 
-	if band == nil {
-		return nil, nil //nolint:nilnil
-	}
-
 	strategy := p.getStrategy()
 
 	// Build QueueInfo map for the strategy.
 	infos := make(map[string]QueueInfo)
-	band.IterateQueues(func(queue flowcontrol.FlowQueueAccessor) (keepIterating bool) {
+	band.IterateQueues(func(queue flowcontrol.FlowQueueAccessor) bool {
 		if queue == nil {
 			return true
 		}
@@ -295,7 +306,6 @@ func (p *ProgramAwarePlugin) Pick(_ context.Context, band flowcontrol.PriorityBa
 		return true
 	})
 
-	// Strategy owns scoring, normalization, and internal bookkeeping.
 	bestQueue, scores := strategy.Pick(band.Priority(), infos)
 
 	// Emit per-queue scores for non-empty queues.
@@ -303,19 +313,8 @@ func (p *ProgramAwarePlugin) Pick(_ context.Context, band flowcontrol.PriorityBa
 		queueScore.WithLabelValues(id).Set(score)
 	}
 
-	// Stash the selected item's enqueue time on the InferenceRequest's own
-	// attribute store so PreRequest can compute the flow-control queue wait
-	// time (enqueue → dispatch). The attribute lifetime is the request
-	// lifetime, so an abandoned request cannot leak into a side map.
-	//
-	// Pick runs on the dispatcher's per-shard Processor.Run goroutine;
-	// PreRequest runs on the per-request director goroutine. The write here
-	// happens-before PreRequest's read because FlowItem.finalizeInternal
-	// (pkg/epp/flowcontrol/controller/internal/item.go) atomically stores the
-	// final state and closes the done channel before EnqueueAndWait returns
-	// to the director — that channel-close is the synchronization edge.
 	if bestQueue != nil {
-		if head := bestQueue.PeekHead(); head != nil {
+		if head := bestQueue.Peek(); head != nil {
 			if req := head.OriginalRequest().InferenceRequest(); req != nil {
 				req.PutAttribute(enqueueTimeAttributeKey, head.EnqueueTime())
 			}
@@ -327,26 +326,6 @@ func (p *ProgramAwarePlugin) Pick(_ context.Context, band flowcontrol.PriorityBa
 	return bestQueue, nil
 }
 
-// getOrCreateMetrics returns the ProgramMetrics for the given program ID, creating if needed.
-// Type assertions use the comma-ok form so a stray non-*ProgramMetrics entry
-// (only reachable via a future bug) degrades to a fresh metrics object instead
-// of panicking the scheduler.
-func (p *ProgramAwarePlugin) getOrCreateMetrics(programID string) *ProgramMetrics {
-	if metricsRaw, ok := p.programMetrics.Load(programID); ok {
-		if m, ok := metricsRaw.(*ProgramMetrics); ok {
-			return m
-		}
-	}
-	m := &ProgramMetrics{}
-	actual, _ := p.programMetrics.LoadOrStore(programID, m)
-	if existing, ok := actual.(*ProgramMetrics); ok {
-		return existing
-	}
-	return m
-}
-
-// runEviction sweeps the programMetrics map on a fixed interval, removing
-// entries idle for longer than ttl. Exits when ctx is cancelled.
 func (p *ProgramAwarePlugin) runEviction(ctx context.Context, interval, ttl time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -360,34 +339,12 @@ func (p *ProgramAwarePlugin) runEviction(ctx context.Context, interval, ttl time
 	}
 }
 
-// evictIdle removes metrics entries whose last completion is older than ttl
-// and that have no live requests. Entries with no completions yet are
-// skipped — eviction would race their first completion.
-//
-// "No live requests" means InFlight==0 (nothing dispatched-but-not-completed)
-// AND TotalRequests==DispatchedCount (nothing produced-but-not-dispatched, i.e.
-// still in the flow-control queue). Without the second check, a request
-// landing between Produce and Pick could be evicted from under the dispatcher.
-//
-// The InFlight check appears twice — before and after the Total/Dispatched
-// check — to close the TOCTOU window where a request lands mid-sweep:
-// PreRequest runs IncrementInFlight before IncrementDispatched
-// (request_hooks.go), so if Total==Dispatched is true at the second gate, a
-// concurrently-running PreRequest must have already done IncrementInFlight,
-// which the third gate catches. This is not a perfectly atomic snapshot but
-// is sufficient given the dispatch path's increment ordering.
-//
-// The Range/Delete pair is still not atomic for arrivals strictly after the
-// final gate: a request landing concurrently can recreate a freshly-deleted
-// entry via getOrCreateMetrics. Strategy state and Prom series for the
-// recreated entry are reseeded on demand by getOrCreateMetrics and
-// strategy.getState, so the reset costs at most one cycle of accumulated
-// per-program state for a long-idle program.
 func (p *ProgramAwarePlugin) evictIdle(ttl time.Duration) {
 	now := time.Now()
 	p.programMetrics.Range(func(key, value any) bool {
 		m, ok := value.(*ProgramMetrics)
 		if !ok {
+			p.evictKey(key)
 			return true
 		}
 		if m.InFlight() != 0 {
@@ -396,8 +353,6 @@ func (p *ProgramAwarePlugin) evictIdle(ttl time.Duration) {
 		if m.TotalRequests() != m.DispatchedCount() {
 			return true
 		}
-		// Re-check InFlight after the Total/Dispatched gate so a PreRequest
-		// that landed mid-sweep cannot be evicted out from under.
 		if m.InFlight() != 0 {
 			return true
 		}
@@ -405,22 +360,28 @@ func (p *ProgramAwarePlugin) evictIdle(ttl time.Duration) {
 		if last.IsZero() || now.Sub(last) <= ttl {
 			return true
 		}
-		p.programMetrics.Delete(key)
-		if id, ok := key.(string); ok {
-			p.getStrategy().EvictProgram(id)
-			deleteSharedSeries(id)
-		}
+		p.evictKey(key)
 		return true
 	})
 }
 
-// computeFairnessIndex returns Jain's Fairness Index over the average wait
-// time per program. Equal average waits = perfect fairness (= 1.0). Programs
-// with no wait observations are skipped. Returns 1.0 when fewer than 2
-// programs have wait data.
+func (p *ProgramAwarePlugin) evictKey(key any) {
+	p.programMetrics.Delete(key)
+	if id, ok := key.(string); ok {
+		p.getStrategy().EvictProgram(id)
+		DeleteSharedSeries(id)
+	}
+}
+
+func jainFairnessIndex(sum, sumSq, n float64) float64 {
+	if n <= 1 || sumSq == 0 {
+		return 1.0
+	}
+	return (sum * sum) / (n * sumSq)
+}
+
 func (p *ProgramAwarePlugin) computeFairnessIndex() float64 {
-	var sum, sumSq float64
-	var n float64
+	var sum, sumSq, n float64
 	p.programMetrics.Range(func(_, value any) bool {
 		m, ok := value.(*ProgramMetrics)
 		if !ok {
@@ -435,8 +396,5 @@ func (p *ProgramAwarePlugin) computeFairnessIndex() float64 {
 		n++
 		return true
 	})
-	if n <= 1 || sumSq == 0 {
-		return 1.0
-	}
-	return (sum * sum) / (n * sumSq)
+	return jainFairnessIndex(sum, sumSq, n)
 }

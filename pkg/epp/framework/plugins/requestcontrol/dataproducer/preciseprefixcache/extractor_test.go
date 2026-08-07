@@ -22,7 +22,7 @@ import (
 	"testing"
 
 	"github.com/go-logr/logr"
-	"github.com/llm-d/llm-d-kv-cache/pkg/kvevents"
+	"github.com/llm-d/llm-d-router/pkg/kvevents"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	k8stypes "k8s.io/apimachinery/pkg/types"
@@ -49,15 +49,16 @@ func newExtractorProducer(discoverPods bool) *Producer {
 		typedName:          plugin.TypedName{Type: PluginType, Name: PluginType},
 		subscribersManager: kvevents.NewSubscriberManager(kvevents.NewPool(cfg, nil, nil, nil)),
 		kvEventsConfig:     cfg,
+		kvCacheIndexer:     &fakeKVCacheIndexer{index: &fakeKVBlockIndex{}},
 		subscriberCtx:      context.Background(),
 	}
 }
 
 func newEndpoint(name, addr string) fwkdl.Endpoint {
 	return fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{
-		NamespacedName: k8stypes.NamespacedName{Namespace: "ns", Name: name},
-		Address:        addr,
-		Port:           "8080",
+		ID:      k8stypes.NamespacedName{Namespace: "ns", Name: name},
+		Address: addr,
+		Port:    "8080",
 	}, nil)
 }
 
@@ -124,7 +125,7 @@ func TestProducer_ExtractEndpoint_IgnoresMissingMetadata(t *testing.T) {
 	defer p.subscribersManager.Shutdown(ctx)
 
 	ep := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{
-		NamespacedName: k8stypes.NamespacedName{Namespace: "ns", Name: "pod-a"},
+		ID: k8stypes.NamespacedName{Namespace: "ns", Name: "pod-a"},
 	}, nil)
 
 	require.NoError(t, p.Extract(ctx, fwkdl.EndpointEvent{
@@ -144,8 +145,8 @@ func TestProducer_EnsureSubscriber_SurvivesRequestCtxCancel(t *testing.T) {
 	reqCtx, cancel := context.WithCancel(context.Background())
 
 	require.NoError(t, p.ensureSubscriber(reqCtx, &fwkdl.EndpointMetadata{
-		NamespacedName: k8stypes.NamespacedName{Namespace: "ns", Name: "pod-a"},
-		Address:        "10.0.0.1", Port: "8080",
+		ID:      k8stypes.NamespacedName{Namespace: "ns", Name: "pod-a"},
+		Address: "10.0.0.1", Port: "8080",
 	}))
 
 	cancel()
@@ -175,10 +176,10 @@ func TestProducer_ExtractEndpoint_OffsetsZMQPortByRankIndex(t *testing.T) {
 		require.NoError(t, p.Extract(ctx, fwkdl.EndpointEvent{
 			Type: fwkdl.EventAddOrUpdate,
 			Endpoint: fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{
-				NamespacedName: k8stypes.NamespacedName{Namespace: "ns", Name: ep.name},
-				Address:        ep.address,
-				Port:           "8080",
-				RankIndex:      ep.rank,
+				ID:        k8stypes.NamespacedName{Namespace: "ns", Name: ep.name},
+				Address:   ep.address,
+				Port:      "8080",
+				RankIndex: ep.rank,
 			}, nil),
 		}))
 	}
@@ -195,6 +196,32 @@ func TestProducer_ExtractEndpoint_OffsetsZMQPortByRankIndex(t *testing.T) {
 	}
 }
 
+func TestProducer_EnsureSubscriber_PassesServingEndpoint(t *testing.T) {
+	cfg := kvevents.DefaultConfig()
+	cfg.DiscoverPods = true
+	cfg.PodDiscoveryConfig = kvevents.DefaultPodReconcilerConfig()
+	cfg.PodDiscoveryConfig.SocketPort = 5557
+
+	subscribers := &fakeSubscriberManager{}
+	p := &Producer{
+		typedName:          plugin.TypedName{Type: PluginType, Name: PluginType},
+		subscribersManager: subscribers,
+		kvEventsConfig:     cfg,
+		subscriberCtx:      context.Background(),
+	}
+
+	require.NoError(t, p.ensureSubscriber(context.Background(), &fwkdl.EndpointMetadata{
+		ID:        k8stypes.NamespacedName{Namespace: "ns", Name: "pod-a-rank-3"},
+		Address:   "10.0.0.1",
+		Port:      "8003",
+		RankIndex: 3,
+	}))
+
+	assert.Equal(t, []string{"ns/pod-a-rank-3"}, subscribers.ids)
+	assert.Equal(t, []string{"10.0.0.1:8003"}, subscribers.sourceEndpoints)
+	assert.Equal(t, []string{"tcp://10.0.0.1:5560"}, subscribers.endpoints)
+}
+
 // RankIndex=0 must dial the base SocketPort unchanged.
 func TestProducer_ExtractEndpoint_SingleRankUsesBaseSocketPort(t *testing.T) {
 	ctx := discardCtx(t)
@@ -204,9 +231,9 @@ func TestProducer_ExtractEndpoint_SingleRankUsesBaseSocketPort(t *testing.T) {
 	require.NoError(t, p.Extract(ctx, fwkdl.EndpointEvent{
 		Type: fwkdl.EventAddOrUpdate,
 		Endpoint: fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{
-			NamespacedName: k8stypes.NamespacedName{Namespace: "ns", Name: "pod-a"},
-			Address:        "10.0.0.1",
-			Port:           "8080",
+			ID:      k8stypes.NamespacedName{Namespace: "ns", Name: "pod-a"},
+			Address: "10.0.0.1",
+			Port:    "8080",
 			// RankIndex stays at its zero value.
 		}, nil),
 	}))
@@ -214,6 +241,51 @@ func TestProducer_ExtractEndpoint_SingleRankUsesBaseSocketPort(t *testing.T) {
 	_, zmqEndpoints := p.subscribersManager.GetActiveSubscribers()
 	assert.Equal(t, []string{"tcp://10.0.0.1:5557"}, zmqEndpoints,
 		"single-rank pod (RankIndex=0) must dial the base SocketPort")
+}
+
+// EventDelete clears index entries for the removed pod's address.
+func TestProducer_ExtractEndpoint_DeleteClearsIndex(t *testing.T) {
+	ctx := discardCtx(t)
+
+	var clearedPod string
+	fakeIndex := &fakeKVBlockIndex{
+		clearFn: func(_ context.Context, podIdentifier string) error {
+			clearedPod = podIdentifier
+			return nil
+		},
+	}
+	fakeIndexer := &fakeKVCacheIndexer{index: fakeIndex}
+
+	cfg := kvevents.DefaultConfig()
+	cfg.DiscoverPods = true
+	cfg.PodDiscoveryConfig = kvevents.DefaultPodReconcilerConfig()
+	cfg.PodDiscoveryConfig.SocketPort = 5557
+
+	p := &Producer{
+		typedName:          plugin.TypedName{Type: PluginType, Name: PluginType},
+		subscribersManager: kvevents.NewSubscriberManager(kvevents.NewPool(cfg, nil, nil, nil)),
+		kvEventsConfig:     cfg,
+		kvCacheIndexer:     fakeIndexer,
+		subscriberCtx:      context.Background(),
+	}
+	defer p.subscribersManager.Shutdown(ctx)
+
+	ep := newEndpoint("pod-clear", "10.0.0.99")
+
+	require.NoError(t, p.Extract(ctx, fwkdl.EndpointEvent{
+		Type:     fwkdl.EventAddOrUpdate,
+		Endpoint: ep,
+	}))
+
+	require.NoError(t, p.Extract(ctx, fwkdl.EndpointEvent{
+		Type:     fwkdl.EventDelete,
+		Endpoint: ep,
+	}))
+
+	assert.Equal(t, "10.0.0.99:8080", clearedPod, "index should be cleared using pod IP:Port matching PodIdentifier format")
+
+	ids, _ := p.subscribersManager.GetActiveSubscribers()
+	assert.Empty(t, ids)
 }
 
 // Delete by NamespacedName must work even when the event has no address.
@@ -231,7 +303,7 @@ func TestProducer_ExtractEndpoint_DeleteWithMissingAddressRemovesExistingSubscri
 	require.Len(t, ids, 1)
 
 	deleteEndpoint := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{
-		NamespacedName: k8stypes.NamespacedName{Namespace: "ns", Name: "pod-a"},
+		ID: k8stypes.NamespacedName{Namespace: "ns", Name: "pod-a"},
 	}, nil)
 
 	require.NoError(t, p.Extract(ctx, fwkdl.EndpointEvent{

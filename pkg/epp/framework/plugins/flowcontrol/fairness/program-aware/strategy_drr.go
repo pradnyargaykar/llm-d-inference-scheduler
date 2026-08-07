@@ -9,6 +9,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	eppmetrics "github.com/llm-d/llm-d-router/pkg/epp/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	compbasemetrics "k8s.io/component-base/metrics"
 )
@@ -132,7 +133,7 @@ func (s *DRRStrategy) Pick(_ int, queues map[string]QueueInfo) (flowcontrol.Flow
 		st.mu.Unlock()
 		deficitTokensGauge.WithLabelValues(id).Set(deficit)
 		var headWaitMs float64
-		if head := qi.Queue.PeekHead(); head != nil {
+		if head := qi.Queue.Peek(); head != nil {
 			headWaitMs = float64(time.Since(head.EnqueueTime()).Milliseconds())
 		}
 
@@ -212,8 +213,8 @@ func (s *DRRStrategy) Collectors() []prometheus.Collector {
 // deficitTokensGauge tracks the DRR deficit per program; only DRRStrategy writes to it.
 var deficitTokensGauge = prometheus.NewGaugeVec(
 	prometheus.GaugeOpts{
-		Subsystem: programAwareSubsystem,
-		Name:      "deficit_tokens",
+		Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+		Name:      "program_aware_deficit_tokens",
 		Help:      metricsutil.HelpMsgWithStability("DRR deficit counter per program (positive = owed service, negative = overserved); decays exponentially when the queue is empty", compbasemetrics.ALPHA),
 	},
 	[]string{"program_id"},

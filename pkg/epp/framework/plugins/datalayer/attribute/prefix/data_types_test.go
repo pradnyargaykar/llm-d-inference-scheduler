@@ -1,0 +1,134 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package prefix
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestPrefixCacheMatchInfo_CachedBlockCountDefaultsToMatchBlocks(t *testing.T) {
+	info := NewPrefixCacheMatchInfo(5, 10, 16)
+	assert.Equal(t, 5, info.MatchBlocks())
+	assert.Equal(t, 10, info.TotalBlocks())
+	assert.Equal(t, 16, info.BlockSizeTokens())
+	// Unset cachedBlockCount mirrors matchBlocks so existing producers and
+	// consumers keep their current behavior.
+	assert.Equal(t, 5, info.CachedBlockCount())
+}
+
+func TestPrefixCacheMatchInfo_WithCachedBlockCount(t *testing.T) {
+	info := NewPrefixCacheMatchInfo(192, 256, 16).WithCachedBlockCount(240)
+	// matchBlocks keeps the tier-weighted ranking value; cachedBlockCount holds
+	// the unweighted literal count.
+	assert.Equal(t, 192, info.MatchBlocks())
+	assert.Equal(t, 240, info.CachedBlockCount())
+}
+
+func TestPrefixCacheMatchInfo_CloneCopiesCachedBlockCount(t *testing.T) {
+	orig := NewPrefixCacheMatchInfo(192, 256, 16).WithCachedBlockCount(240)
+	clone, ok := orig.Clone().(*PrefixCacheMatchInfo)
+	require.True(t, ok)
+	assert.Equal(t, orig.MatchBlocks(), clone.MatchBlocks())
+	assert.Equal(t, orig.TotalBlocks(), clone.TotalBlocks())
+	assert.Equal(t, orig.BlockSizeTokens(), clone.BlockSizeTokens())
+	assert.Equal(t, orig.CachedBlockCount(), clone.CachedBlockCount())
+
+	// Mutating the clone must not affect the original.
+	clone.WithCachedBlockCount(1)
+	assert.Equal(t, 240, orig.CachedBlockCount())
+	assert.Equal(t, 1, clone.CachedBlockCount())
+}
+
+func TestPrefixCacheMatchInfo_CachedBlocksByTierDefaultsToNil(t *testing.T) {
+	info := NewPrefixCacheMatchInfo(5, 10, 16)
+	// Nil distinguishes producers without tier data from a producer that saw
+	// zero cached blocks in every tier.
+	assert.Nil(t, info.CachedBlocksByTier())
+}
+
+func TestPrefixCacheMatchInfo_WithCachedBlocksByTier(t *testing.T) {
+	info := NewPrefixCacheMatchInfo(5, 10, 16).WithCachedBlocksByTier(map[string]int{"gpu": 3, "cpu": 2})
+	assert.Equal(t, map[string]int{"gpu": 3, "cpu": 2}, info.CachedBlocksByTier())
+
+	empty := NewPrefixCacheMatchInfo(0, 10, 16).WithCachedBlocksByTier(map[string]int{})
+	assert.NotNil(t, empty.CachedBlocksByTier())
+	assert.Empty(t, empty.CachedBlocksByTier())
+}
+
+func TestPrefixCacheMatchInfo_CloneDeepCopiesCachedBlocksByTier(t *testing.T) {
+	orig := NewPrefixCacheMatchInfo(5, 10, 16).WithCachedBlocksByTier(map[string]int{"gpu": 3, "cpu": 2})
+	clone, ok := orig.Clone().(*PrefixCacheMatchInfo)
+	require.True(t, ok)
+	assert.Equal(t, orig.CachedBlocksByTier(), clone.CachedBlocksByTier())
+
+	// Mutating the clone's map must not affect the original.
+	clone.CachedBlocksByTier()["gpu"] = 99
+	assert.Equal(t, 3, orig.CachedBlocksByTier()["gpu"])
+
+	nilClone, ok := NewPrefixCacheMatchInfo(5, 10, 16).Clone().(*PrefixCacheMatchInfo)
+	require.True(t, ok)
+	assert.Nil(t, nilClone.CachedBlocksByTier())
+}
+
+func TestPrefixCacheMatchInfo_MM(t *testing.T) {
+	tests := []struct {
+		name      string
+		info      *PrefixCacheMatchInfo
+		wantMatch int
+		wantTotal int
+		wantBlock int
+		wantMM    *MMMatchInfo
+	}{
+		{
+			name:      "constructor leaves mm nil",
+			info:      NewPrefixCacheMatchInfo(5, 10, 16),
+			wantMatch: 5, wantTotal: 10, wantBlock: 16, wantMM: nil,
+		},
+		{
+			name:      "WithMM attaches non-zero",
+			info:      NewPrefixCacheMatchInfo(5, 10, 16).WithMM(MMMatchInfo{MatchBlocks: 2}),
+			wantMatch: 5, wantTotal: 10, wantBlock: 16, wantMM: &MMMatchInfo{MatchBlocks: 2},
+		},
+		{
+			name:      "WithMM(zero) attaches present-but-zero",
+			info:      NewPrefixCacheMatchInfo(5, 10, 16).WithMM(MMMatchInfo{MatchBlocks: 0}),
+			wantMatch: 5, wantTotal: 10, wantBlock: 16, wantMM: &MMMatchInfo{MatchBlocks: 0},
+		},
+		{
+			name:      "clone preserves nil mm",
+			info:      NewPrefixCacheMatchInfo(5, 10, 16).Clone().(*PrefixCacheMatchInfo),
+			wantMatch: 5, wantTotal: 10, wantBlock: 16, wantMM: nil,
+		},
+		{
+			name:      "clone preserves mm",
+			info:      NewPrefixCacheMatchInfo(7, 12, 64).WithMM(MMMatchInfo{MatchBlocks: 3}).Clone().(*PrefixCacheMatchInfo),
+			wantMatch: 7, wantTotal: 12, wantBlock: 64, wantMM: &MMMatchInfo{MatchBlocks: 3},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.wantMatch, tt.info.MatchBlocks())
+			assert.Equal(t, tt.wantTotal, tt.info.TotalBlocks())
+			assert.Equal(t, tt.wantBlock, tt.info.BlockSizeTokens())
+			assert.Equal(t, tt.wantMM, tt.info.MM())
+		})
+	}
+}

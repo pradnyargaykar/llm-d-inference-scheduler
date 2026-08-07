@@ -1,9 +1,30 @@
+/*
+Copyright 2026 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package programaware
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
@@ -11,283 +32,282 @@ import (
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	requesthandling "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 )
 
-// --- Factory tests ---
+func decoder(s string) *json.Decoder { return json.NewDecoder(strings.NewReader(s)) }
 
-func TestFactory(t *testing.T) {
-	p, err := ProgramAwarePluginFactory("test-instance", nil, nil)
+func TestFactory_DefaultConfig(t *testing.T) {
+	p, err := ProgramAwarePluginFactory("test", nil, nil)
 	require.NoError(t, err)
 	require.NotNil(t, p)
 
 	assert.Equal(t, ProgramAwarePluginType, p.TypedName().Type)
-	assert.Equal(t, "test-instance", p.TypedName().Name)
+	assert.Equal(t, "test", p.TypedName().Name)
 }
 
-// --- ProgramMetrics tests ---
-
-func TestProgramMetrics_AverageWaitTime(t *testing.T) {
-	m := &ProgramMetrics{}
-
-	assert.Equal(t, 0.0, m.AverageWaitTime(), "no data → 0")
-	assert.Equal(t, int64(0), m.WaitCount())
-
-	m.RecordWaitTime(100)
-	assert.InDelta(t, 100.0, m.AverageWaitTime(), 0.01)
-
-	m.RecordWaitTime(200)
-	// (100 + 200) / 2 = 150
-	assert.InDelta(t, 150.0, m.AverageWaitTime(), 0.01)
-
-	m.RecordWaitTime(50)
-	// (100 + 200 + 50) / 3 = 116.67
-	assert.InDelta(t, 116.67, m.AverageWaitTime(), 0.01)
-	assert.Equal(t, int64(3), m.WaitCount())
+func TestFactory_LASConfig(t *testing.T) {
+	cfg := `{"strategy":"las","lasWeightService":0.7,"lasWeightHeadWait":0.3,"lasHalfLifeSeconds":60}`
+	p, err := ProgramAwarePluginFactory("test", decoder(cfg), nil)
+	require.NoError(t, err)
+	require.NotNil(t, p)
 }
 
-func TestProgramMetrics_Counters(t *testing.T) {
-	m := &ProgramMetrics{}
-
-	m.IncrementRequests()
-	m.IncrementRequests()
-	m.IncrementDispatched()
-	m.RecordTokens(100, 50)
-	m.RecordTokens(200, 75)
-
-	assert.Equal(t, int64(2), m.TotalRequests())
-	assert.Equal(t, int64(1), m.DispatchedCount())
+func TestFactory_UnknownStrategy(t *testing.T) {
+	_, err := ProgramAwarePluginFactory("test", decoder(`{"strategy":"wfq"}`), nil)
+	require.Error(t, err)
 }
 
-// --- Pick tests ---
+func TestFactory_InvalidConfig(t *testing.T) {
+	cases := map[string]string{
+		"negative ttl":       `{"evictionTtlSeconds":-1}`,
+		"zero sweep":         `{"evictionSweepSeconds":0}`,
+		"negative weight":    `{"weightService":-0.1}`,
+		"decay factor > 1":   `{"serviceDecayFactor":1.5}`,
+		"decay factor 0":     `{"serviceDecayFactor":0}`,
+		"negative half life": `{"serviceHalfLifeSeconds":-1}`,
+	}
+	for name, cfg := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := ProgramAwarePluginFactory("test", decoder(cfg), nil)
+			require.Error(t, err)
+		})
+	}
+}
 
 func TestPick_NilBand(t *testing.T) {
 	p := &ProgramAwarePlugin{}
-	queue, err := p.Pick(context.Background(), nil)
-	assert.NoError(t, err)
-	assert.Nil(t, queue)
+	got, err := p.Pick(context.Background(), nil)
+	require.NoError(t, err)
+	assert.Nil(t, got)
 }
 
 func TestPick_AllQueuesEmpty(t *testing.T) {
-	p := &ProgramAwarePlugin{}
-
 	band := &fwkfcmocks.MockPriorityBandAccessor{
+		PriorityV: 0,
 		IterateQueuesFunc: func(cb func(flowcontrol.FlowQueueAccessor) bool) {
-			cb(&fwkfcmocks.MockFlowQueueAccessor{LenV: 0, FlowKeyV: flowcontrol.FlowKey{ID: "prog-a"}})
-			cb(&fwkfcmocks.MockFlowQueueAccessor{LenV: 0, FlowKeyV: flowcontrol.FlowKey{ID: "prog-b"}})
+			cb(&fwkfcmocks.MockFlowQueueAccessor{LenV: 0, FlowKeyV: flowcontrol.FlowKey{ID: "p1"}})
+			cb(&fwkfcmocks.MockFlowQueueAccessor{LenV: 0, FlowKeyV: flowcontrol.FlowKey{ID: "p2"}})
 		},
 	}
-
-	queue, err := p.Pick(context.Background(), band)
-	assert.NoError(t, err)
-	assert.Nil(t, queue)
+	p := &ProgramAwarePlugin{}
+	got, err := p.Pick(context.Background(), band)
+	require.NoError(t, err)
+	assert.Nil(t, got)
 }
 
-func TestPick_SingleNonEmptyQueue(t *testing.T) {
-	p := &ProgramAwarePlugin{}
-
-	queueA := &fwkfcmocks.MockFlowQueueAccessor{
-		LenV:     3,
-		FlowKeyV: flowcontrol.FlowKey{ID: "prog-a"},
-		PeekHeadV: &fwkfcmocks.MockQueueItemAccessor{
-			EnqueueTimeV: time.Now().Add(-2 * time.Second),
+func TestPick_SingleNonEmptyQueue_StashesEnqueueTime(t *testing.T) {
+	enqueue := time.Now().Add(-100 * time.Millisecond)
+	req := &fwksched.InferenceRequest{FairnessID: "alpha"}
+	item := &fwkfcmocks.MockQueueItemAccessor{
+		EnqueueTimeV: enqueue,
+		OriginalRequestV: &fwkfcmocks.MockFlowControlRequest{
+			IDV:               "req-1",
+			InferenceRequestV: req,
 		},
 	}
-
-	band := &fwkfcmocks.MockPriorityBandAccessor{
-		IterateQueuesFunc: func(cb func(flowcontrol.FlowQueueAccessor) bool) {
-			cb(queueA)
-			cb(&fwkfcmocks.MockFlowQueueAccessor{LenV: 0, FlowKeyV: flowcontrol.FlowKey{ID: "prog-b"}})
-		},
-	}
-
-	queue, err := p.Pick(context.Background(), band)
-	assert.NoError(t, err)
-	assert.Equal(t, queueA, queue)
-}
-
-func TestPick_RecordsEnqueueTime(t *testing.T) {
-	p := &ProgramAwarePlugin{}
-
-	enqueueTime := time.Now().Add(-500 * time.Millisecond)
-	request := &fwksched.InferenceRequest{RequestID: "req-123"}
-	queueA := &fwkfcmocks.MockFlowQueueAccessor{
+	queue := &fwkfcmocks.MockFlowQueueAccessor{
 		LenV:     1,
-		FlowKeyV: flowcontrol.FlowKey{ID: "prog-a"},
-		PeekHeadV: &fwkfcmocks.MockQueueItemAccessor{
-			EnqueueTimeV: enqueueTime,
-			OriginalRequestV: &fwkfcmocks.MockFlowControlRequest{
-				IDV:               "req-123",
-				InferenceRequestV: request,
-			},
-		},
+		FlowKeyV: flowcontrol.FlowKey{ID: "alpha"},
+		PeekV:    item,
 	}
-
 	band := &fwkfcmocks.MockPriorityBandAccessor{
-		IterateQueuesFunc: func(cb func(flowcontrol.FlowQueueAccessor) bool) {
-			cb(queueA)
-		},
+		IterateQueuesFunc: func(cb func(flowcontrol.FlowQueueAccessor) bool) { cb(queue) },
 	}
 
-	queue, err := p.Pick(context.Background(), band)
-	assert.NoError(t, err)
-	assert.Equal(t, queueA, queue)
-
-	// Verify Pick() stored the enqueue time on the request's own attribute store.
-	storedTime, ok := fwksched.ReadRequestAttribute[time.Time](request, enqueueTimeAttributeKey)
-	require.True(t, ok, "Pick should stash enqueue time on the request")
-	assert.Equal(t, enqueueTime, storedTime, "stored time should be the item's enqueue time")
-}
-
-// --- Produce tests ---
-
-func TestProduce_UpdatesMetrics(t *testing.T) {
 	p := &ProgramAwarePlugin{}
+	got, err := p.Pick(context.Background(), band)
+	require.NoError(t, err)
+	assert.Equal(t, queue, got)
 
-	request := &fwksched.InferenceRequest{
-		RequestID:  "req-1",
-		FairnessID: "prog-a",
-	}
-
-	err := p.Produce(context.Background(), request, nil)
-	assert.NoError(t, err)
-
-	// Check metrics were created and incremented.
-	metricsRaw, ok := p.programMetrics.Load("prog-a")
+	stashed, ok := fwksched.ReadRequestAttribute[time.Time](req, enqueueTimeAttributeKey)
 	require.True(t, ok)
-	metrics := metricsRaw.(*ProgramMetrics)
-	assert.Equal(t, int64(1), metrics.TotalRequests())
+	assert.Equal(t, enqueue, stashed)
 }
 
-func TestProduce_NoFairnessID(t *testing.T) {
+func TestPreRequest_RecordsDispatchAndWait(t *testing.T) {
+	enqueue := time.Now().Add(-50 * time.Millisecond)
+	req := &fwksched.InferenceRequest{FairnessID: "alpha"}
+	req.PutAttribute(enqueueTimeAttributeKey, enqueue)
+
 	p := &ProgramAwarePlugin{}
+	p.PreRequest(context.Background(), req, nil)
 
-	request := &fwksched.InferenceRequest{
-		RequestID: "req-1",
-	}
-
-	err := p.Produce(context.Background(), request, nil)
-	assert.NoError(t, err)
-
-	// No metrics should be created.
-	_, ok := p.programMetrics.Load("")
-	assert.False(t, ok)
+	m := p.getOrCreateMetrics("alpha")
+	assert.Equal(t, int64(1), m.DispatchedCount())
+	assert.Equal(t, int64(1), m.InFlight())
+	assert.Equal(t, int64(1), m.WaitCount())
+	assert.Greater(t, m.AverageWaitTime(), 0.0)
 }
 
-// --- PreRequest tests ---
-
-func TestPreRequest_RecordsWaitTime(t *testing.T) {
+func TestPreRequest_NoEnqueueAttribute_StillDispatches(t *testing.T) {
+	req := &fwksched.InferenceRequest{FairnessID: "alpha"}
 	p := &ProgramAwarePlugin{}
+	p.PreRequest(context.Background(), req, nil)
 
-	p.programMetrics.Store("prog-a", &ProgramMetrics{})
-
-	request := &fwksched.InferenceRequest{
-		RequestID:  "req-1",
-		FairnessID: "prog-a",
-	}
-	// Simulate Pick() having stashed the enqueue time 50ms ago on the request.
-	request.PutAttribute(enqueueTimeAttributeKey, time.Now().Add(-50*time.Millisecond))
-
-	p.PreRequest(context.Background(), request, nil)
-
-	metricsRaw, _ := p.programMetrics.Load("prog-a")
-	metrics := metricsRaw.(*ProgramMetrics)
-	assert.Equal(t, int64(1), metrics.DispatchedCount())
-	assert.Greater(t, metrics.AverageWaitTime(), 0.0)
+	m := p.getOrCreateMetrics("alpha")
+	assert.Equal(t, int64(1), m.DispatchedCount())
+	assert.Equal(t, int64(1), m.InFlight())
+	assert.Equal(t, int64(0), m.WaitCount())
 }
 
-// --- ResponseComplete tests ---
-
-func TestResponseComplete_RecordsTokens(t *testing.T) {
+func TestPreRequest_NoFairnessID_FallsBackToDefault(t *testing.T) {
+	req := &fwksched.InferenceRequest{}
 	p := &ProgramAwarePlugin{}
-	p.programMetrics.Store("prog-a", &ProgramMetrics{})
+	p.PreRequest(context.Background(), req, nil)
 
-	request := &fwksched.InferenceRequest{
-		RequestID:  "req-1",
-		FairnessID: "prog-a",
-	}
-	response := &fwkrc.Response{
-		EndOfStream: true,
-		Usage: requesthandling.Usage{
-			PromptTokens:     100,
-			CompletionTokens: 50,
-		},
-	}
-
-	p.ResponseBody(context.Background(), request, response, &datalayer.EndpointMetadata{})
-
-	metricsRaw, _ := p.programMetrics.Load("prog-a")
-	metrics := metricsRaw.(*ProgramMetrics)
-
-	// EWMA token cost should be recorded: 100*1 + 50*2 = 200 weighted tokens.
-	assert.Greater(t, metrics.AverageTokens(), 0.0, "token usage should be recorded")
+	got, ok := p.programMetrics.Load(metadata.DefaultFairnessID)
+	require.True(t, ok, "default fairness ID entry should be created")
+	m, ok := got.(*ProgramMetrics)
+	require.True(t, ok)
+	assert.Equal(t, int64(1), m.DispatchedCount())
 }
 
-func TestResponseBody_IntermediateChunks_AreNoOp(t *testing.T) {
-	// Streaming responses fire ResponseBody once per chunk; only the final
-	// chunk (EndOfStream=true) should perform terminal-state work. Verifies
-	// InFlight is decremented exactly once and tokens are recorded once.
+func TestResponseBody_FinalChunkOnly(t *testing.T) {
+	req := &fwksched.InferenceRequest{FairnessID: "alpha"}
 	p := &ProgramAwarePlugin{}
-	m := &ProgramMetrics{}
-	p.programMetrics.Store("prog-a", m)
-	m.IncrementInFlight() // simulates PreRequest
+	m := p.getOrCreateMetrics("alpha")
+	seedTime := m.LastCompletionTime()
+	m.RecordDispatched(time.Time{})
 
-	request := &fwksched.InferenceRequest{RequestID: "req-1", FairnessID: "prog-a"}
+	// Intermediate chunk: in-flight unchanged, completion time unchanged.
+	p.ResponseBody(context.Background(), req, &fwkrc.Response{EndOfStream: false}, nil)
+	assert.Equal(t, int64(1), m.InFlight())
+	assert.Equal(t, seedTime, m.LastCompletionTime())
 
-	// Five intermediate chunks — must be no-ops.
-	for range 5 {
-		p.ResponseBody(context.Background(), request, &fwkrc.Response{EndOfStream: false}, &datalayer.EndpointMetadata{})
-	}
-	assert.Equal(t, int64(1), m.InFlight(), "intermediate chunks must not decrement InFlight")
-	assert.Equal(t, 0.0, m.AverageTokens(), "intermediate chunks must not record tokens")
-
-	// Final chunk fires the terminal hook exactly once.
-	finalResp := &fwkrc.Response{
+	// Final chunk: completion advanced, in-flight decremented.
+	time.Sleep(time.Millisecond)
+	p.ResponseBody(context.Background(), req, &fwkrc.Response{
 		EndOfStream: true,
 		Usage:       requesthandling.Usage{PromptTokens: 100, CompletionTokens: 50},
-	}
-	p.ResponseBody(context.Background(), request, finalResp, &datalayer.EndpointMetadata{})
+	}, nil)
 	assert.Equal(t, int64(0), m.InFlight())
-	assert.Greater(t, m.AverageTokens(), 0.0, "terminal chunk records token cost")
+	assert.True(t, m.LastCompletionTime().After(seedTime))
+	assert.Greater(t, m.AverageTokens(), 0.0)
 }
 
-func TestResponseComplete_NilResponse_NoOp(t *testing.T) {
-	// A nil response must not run terminal work — the final-chunk hook is
-	// the only place tokens are recorded and InFlight is decremented.
+func TestResponseBody_NilSafe(t *testing.T) {
 	p := &ProgramAwarePlugin{}
-	m := &ProgramMetrics{}
-	p.programMetrics.Store("prog-a", m)
-	m.IncrementInFlight()
-
-	request := &fwksched.InferenceRequest{RequestID: "req-1", FairnessID: "prog-a"}
-
-	p.ResponseBody(context.Background(), request, nil, nil)
-	assert.Equal(t, int64(1), m.InFlight(), "nil response must not decrement InFlight")
-	assert.Equal(t, 0.0, m.AverageTokens(), "nil response must not record tokens")
+	p.ResponseBody(context.Background(), nil, &fwkrc.Response{EndOfStream: true}, nil)
+	p.ResponseBody(context.Background(), &fwksched.InferenceRequest{}, nil, nil)
 }
 
-// --- rangeNormalize tests ---
-
-func TestRangeNormalize(t *testing.T) {
-	assert.InDelta(t, 0.0, rangeNormalize(0, 0, 100), 0.001)
-	assert.InDelta(t, 0.5, rangeNormalize(50, 0, 100), 0.001)
-	assert.InDelta(t, 1.0, rangeNormalize(100, 0, 100), 0.001)
-	assert.InDelta(t, 0.5, rangeNormalize(42, 42, 42), 0.001, "min==max returns 0.5")
-	assert.InDelta(t, 0.5, rangeNormalize(-10, -20, 0), 0.001, "works with negative range")
-	assert.InDelta(t, 0.0, rangeNormalize(-20, -20, 0), 0.001, "min of negative range")
-	assert.InDelta(t, 1.0, rangeNormalize(0, -20, 0), 0.001, "max of negative range")
-}
-
-// --- Produces / Consumes tests ---
-
-func TestProducesConsumes(t *testing.T) {
+func TestEvictIdle_RemovesIdle(t *testing.T) {
 	p := &ProgramAwarePlugin{}
-	assert.Empty(t, p.Produces())
-	assert.Empty(t, p.Consumes())
+	m := p.getOrCreateMetrics("alpha")
+	m.IncrementRequests()
+	m.RecordDispatched(time.Time{})
+	m.RecordCompletion(time.Now().Add(-10 * time.Second))
+
+	p.evictIdle(time.Second)
+
+	_, exists := p.programMetrics.Load("alpha")
+	assert.False(t, exists)
 }
 
-// --- Full lifecycle integration test ---
+func TestEvictIdle_KeepsInFlight(t *testing.T) {
+	p := &ProgramAwarePlugin{}
+	m := p.getOrCreateMetrics("alpha")
+	m.RecordDispatched(time.Time{}) // inFlight = 1
+	m.mu.Lock()
+	m.lastCompletionTime = time.Now().Add(-10 * time.Second)
+	m.mu.Unlock()
+
+	p.evictIdle(time.Second)
+
+	_, exists := p.programMetrics.Load("alpha")
+	assert.True(t, exists)
+}
+
+func TestEvictIdle_KeepsRecent(t *testing.T) {
+	p := &ProgramAwarePlugin{}
+	m := p.getOrCreateMetrics("alpha")
+	m.RecordDispatched(time.Time{})
+	m.RecordCompletion(time.Now())
+
+	p.evictIdle(time.Hour)
+
+	_, exists := p.programMetrics.Load("alpha")
+	assert.True(t, exists)
+}
+
+func TestComputeFairnessIndex_EqualWaits(t *testing.T) {
+	p := &ProgramAwarePlugin{}
+	for _, id := range []string{"a", "b", "c"} {
+		m := p.getOrCreateMetrics(id)
+		m.RecordDispatched(time.Now().Add(-100 * time.Millisecond))
+	}
+	got := p.computeFairnessIndex()
+	assert.InDelta(t, 1.0, got, 0.05)
+}
+
+func TestComputeFairnessIndex_SingleProgram(t *testing.T) {
+	p := &ProgramAwarePlugin{}
+	m := p.getOrCreateMetrics("a")
+	m.RecordDispatched(time.Now().Add(-50 * time.Millisecond))
+	assert.Equal(t, 1.0, p.computeFairnessIndex())
+}
+
+func TestComputeFairnessIndex_NoData(t *testing.T) {
+	p := &ProgramAwarePlugin{}
+	assert.Equal(t, 1.0, p.computeFairnessIndex())
+}
+
+func TestComputeFairnessIndex_SkewedWaits(t *testing.T) {
+	p := &ProgramAwarePlugin{}
+	a := p.getOrCreateMetrics("a")
+	b := p.getOrCreateMetrics("b")
+	a.RecordDispatched(time.Now().Add(-10 * time.Millisecond))
+	b.RecordDispatched(time.Now().Add(-1000 * time.Millisecond))
+	got := p.computeFairnessIndex()
+	assert.Less(t, got, 0.9, "skewed waits should produce sub-1.0 fairness")
+}
+
+func TestGetOrCreateMetrics_Idempotent(t *testing.T) {
+	p := &ProgramAwarePlugin{}
+	a := p.getOrCreateMetrics("alpha")
+	b := p.getOrCreateMetrics("alpha")
+	assert.Same(t, a, b)
+}
+
+func TestDumpState(t *testing.T) {
+	p := &ProgramAwarePlugin{}
+	p.getOrCreateMetrics("prog-a").RecordDispatched(time.Now().Add(-10 * time.Millisecond))
+	p.getOrCreateMetrics("prog-b").RecordDispatched(time.Now().Add(-20 * time.Millisecond))
+
+	payload, err := p.DumpState()
+	require.NoError(t, err)
+
+	var state fairnessDumpState
+	require.NoError(t, json.Unmarshal(payload, &state))
+	assert.Equal(t, 2, state.TotalPrograms)
+	assert.Equal(t, int64(2), state.TotalInFlight)
+	assert.GreaterOrEqual(t, state.FairnessIndex, 0.0)
+	assert.LessOrEqual(t, state.FairnessIndex, 1.0)
+}
+
+func TestDumpStateOmitsProgramIDs(t *testing.T) {
+	p := &ProgramAwarePlugin{}
+	p.getOrCreateMetrics("secret-tenant-xyz").RecordDispatched(time.Now().Add(-5 * time.Millisecond))
+
+	payload, err := p.DumpState()
+	require.NoError(t, err)
+	assert.NotContains(t, string(payload), "secret-tenant-xyz")
+}
+
+func TestDumpStateEmpty(t *testing.T) {
+	p := &ProgramAwarePlugin{}
+
+	payload, err := p.DumpState()
+	require.NoError(t, err)
+	assert.True(t, json.Valid(payload))
+
+	var state fairnessDumpState
+	require.NoError(t, json.Unmarshal(payload, &state))
+	assert.Equal(t, 0, state.TotalPrograms)
+	assert.Equal(t, int64(0), state.TotalInFlight)
+	assert.Equal(t, 1.0, state.FairnessIndex)
+}
 
 func TestFullLifecycle(t *testing.T) {
 	p := &ProgramAwarePlugin{name: "test"}
@@ -298,169 +318,17 @@ func TestFullLifecycle(t *testing.T) {
 		FairnessID: programID,
 	}
 
-	// 0. Simulate Pick() stashing the enqueue time on the request (flow
-	//    control layer). In production this happens when the request is
-	//    dispatched from the queue.
 	request.PutAttribute(enqueueTimeAttributeKey, time.Now().Add(-20*time.Millisecond))
 
-	// 1. PrepareData (runs after flow control dispatch)
-	err := p.Produce(context.Background(), request, nil)
-	require.NoError(t, err)
-
-	// Verify metrics created.
-	metricsRaw, ok := p.programMetrics.Load(programID)
-	require.True(t, ok)
-	metrics := metricsRaw.(*ProgramMetrics)
-	assert.Equal(t, int64(1), metrics.TotalRequests())
-	assert.Equal(t, int64(0), metrics.DispatchedCount())
-
-	// 2. PreRequest — computes wait time from the request's enqueue-time attribute
 	p.PreRequest(context.Background(), request, nil)
-	assert.Equal(t, int64(1), metrics.DispatchedCount())
-	assert.Greater(t, metrics.AverageWaitTime(), 0.0, "wait time should reflect queue residence time")
+	m := p.getOrCreateMetrics(programID)
+	assert.Equal(t, int64(1), m.DispatchedCount())
+	assert.Greater(t, m.AverageWaitTime(), 0.0)
 
-	// 3. ResponseComplete
-	response := &fwkrc.Response{Headers: map[string]string{}, EndOfStream: true}
-	response.Usage = requesthandling.Usage{PromptTokens: 42, CompletionTokens: 17}
+	response := &fwkrc.Response{
+		EndOfStream: true,
+		Usage:       requesthandling.Usage{PromptTokens: 42, CompletionTokens: 17},
+	}
 	p.ResponseBody(context.Background(), request, response, &datalayer.EndpointMetadata{})
-	// 42 input + 17 output → weighted cost 42 + 34 = 76 tokens.
-	assert.InDelta(t, 76.0, metrics.AverageTokens(), 0.01)
-}
-
-// --- fairness index tests (wait-time-based) ---
-
-func TestComputeFairnessIndex_EqualWaitTime(t *testing.T) {
-	p := &ProgramAwarePlugin{}
-
-	mA := &ProgramMetrics{}
-	mA.RecordWaitTime(100)
-	mA.RecordWaitTime(100)
-	p.programMetrics.Store("prog-a", mA)
-
-	mB := &ProgramMetrics{}
-	mB.RecordWaitTime(100)
-	mB.RecordWaitTime(100)
-	p.programMetrics.Store("prog-b", mB)
-
-	assert.InDelta(t, 1.0, p.computeFairnessIndex(), 0.001, "equal wait time → perfect fairness")
-}
-
-func TestComputeFairnessIndex_SkewedWaitTime(t *testing.T) {
-	p := &ProgramAwarePlugin{}
-
-	mA := &ProgramMetrics{}
-	mA.RecordWaitTime(1000)
-	p.programMetrics.Store("prog-a", mA)
-
-	mB := &ProgramMetrics{}
-	mB.RecordWaitTime(100)
-	p.programMetrics.Store("prog-b", mB)
-
-	idx := p.computeFairnessIndex()
-	assert.Less(t, idx, 1.0, "skewed wait should produce index < 1")
-	// J = (1000+100)^2 / (2 * (1000^2 + 100^2)) ≈ 0.599
-	assert.InDelta(t, 0.599, idx, 0.01)
-}
-
-func TestComputeFairnessIndex_SingleProgram(t *testing.T) {
-	p := &ProgramAwarePlugin{}
-
-	m := &ProgramMetrics{}
-	m.RecordWaitTime(500)
-	p.programMetrics.Store("prog-a", m)
-
-	assert.InDelta(t, 1.0, p.computeFairnessIndex(), 0.001, "single program → trivially fair")
-}
-
-func TestComputeFairnessIndex_NoWaitData(t *testing.T) {
-	p := &ProgramAwarePlugin{}
-
-	// Programs exist but have no wait observations yet.
-	p.programMetrics.Store("prog-a", &ProgramMetrics{})
-	p.programMetrics.Store("prog-b", &ProgramMetrics{})
-
-	assert.InDelta(t, 1.0, p.computeFairnessIndex(), 0.001, "no wait data → 1.0")
-}
-
-// --- Two-pass scoring tests ---
-
-func TestPick_AllIdenticalMetrics(t *testing.T) {
-	// When all queues have identical metrics, Pick should still return a valid queue.
-	p := &ProgramAwarePlugin{}
-
-	now := time.Now()
-	queueA := &fwkfcmocks.MockFlowQueueAccessor{
-		LenV:     1,
-		FlowKeyV: flowcontrol.FlowKey{ID: "prog-a"},
-		PeekHeadV: &fwkfcmocks.MockQueueItemAccessor{
-			EnqueueTimeV:     now,
-			OriginalRequestV: &fwkfcmocks.MockFlowControlRequest{IDV: "a-req"},
-		},
-	}
-	queueB := &fwkfcmocks.MockFlowQueueAccessor{
-		LenV:     1,
-		FlowKeyV: flowcontrol.FlowKey{ID: "prog-b"},
-		PeekHeadV: &fwkfcmocks.MockQueueItemAccessor{
-			EnqueueTimeV:     now,
-			OriginalRequestV: &fwkfcmocks.MockFlowControlRequest{IDV: "b-req"},
-		},
-	}
-
-	band := &fwkfcmocks.MockPriorityBandAccessor{
-		IterateQueuesFunc: func(cb func(flowcontrol.FlowQueueAccessor) bool) {
-			cb(queueA)
-			cb(queueB)
-		},
-	}
-
-	queue, err := p.Pick(context.Background(), band)
-	assert.NoError(t, err)
-	assert.NotNil(t, queue, "should select a queue even when all metrics are identical")
-}
-
-// --- Eviction tests ---
-
-func TestEvictIdle_RemovesIdleEntries(t *testing.T) {
-	p := &ProgramAwarePlugin{}
-
-	idle := &ProgramMetrics{}
-	idle.RecordServiceRate(100, time.Now().Add(-1*time.Hour))
-	p.programMetrics.Store("idle-prog", idle)
-
-	recent := &ProgramMetrics{}
-	recent.RecordServiceRate(100, time.Now())
-	p.programMetrics.Store("recent-prog", recent)
-
-	p.evictIdle(time.Minute)
-
-	_, idleStillThere := p.programMetrics.Load("idle-prog")
-	_, recentStillThere := p.programMetrics.Load("recent-prog")
-	assert.False(t, idleStillThere, "program past TTL should be evicted")
-	assert.True(t, recentStillThere, "program inside TTL must be kept")
-}
-
-func TestEvictIdle_KeepsInFlight(t *testing.T) {
-	p := &ProgramAwarePlugin{}
-
-	m := &ProgramMetrics{}
-	m.RecordServiceRate(100, time.Now().Add(-1*time.Hour))
-	m.IncrementInFlight()
-	p.programMetrics.Store("busy-prog", m)
-
-	p.evictIdle(time.Minute)
-
-	_, ok := p.programMetrics.Load("busy-prog")
-	assert.True(t, ok, "program with in-flight requests must not be evicted regardless of TTL")
-}
-
-func TestEvictIdle_KeepsZeroCompletion(t *testing.T) {
-	p := &ProgramAwarePlugin{}
-
-	// Fresh entry with no completions yet — e.g. queued but not dispatched.
-	p.programMetrics.Store("new-prog", &ProgramMetrics{})
-
-	p.evictIdle(time.Nanosecond)
-
-	_, ok := p.programMetrics.Load("new-prog")
-	assert.True(t, ok, "program with no completion time must not be evicted")
+	assert.InDelta(t, 76.0, m.AverageTokens(), 0.01)
 }

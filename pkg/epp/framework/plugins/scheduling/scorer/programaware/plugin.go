@@ -168,7 +168,7 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 	}
 
 	for _, endpoint := range endpoints {
-		podID := endpoint.GetMetadata().NamespacedName.String()
+		podID := endpoint.GetMetadata().GetNamespacedName().String()
 
 		// Prefix Cache Match Ratio (0.0 to 1.0)
 		cacheScore := p.getCacheScore(ctx, endpoint)
@@ -232,7 +232,7 @@ func (p *Plugin) leastLoadedPod(endpoints []scheduling.Endpoint) scheduling.Endp
 	keys := make([]string, len(endpoints))
 	byKey := make(map[string]scheduling.Endpoint, len(endpoints))
 	for i, ep := range endpoints {
-		k := ep.GetMetadata().NamespacedName.String()
+		k := ep.GetMetadata().GetNamespacedName().String()
 		keys[i] = k
 		byKey[k] = ep
 	}
@@ -373,5 +373,5 @@ func chosenPod(result *scheduling.SchedulingResult) (string, bool) {
 	if !ok || profile == nil || len(profile.TargetEndpoints) == 0 {
 		return "", false
 	}
-	return profile.TargetEndpoints[0].GetMetadata().NamespacedName.String(), true
+	return profile.TargetEndpoints[0].GetMetadata().GetNamespacedName().String(), true
 }

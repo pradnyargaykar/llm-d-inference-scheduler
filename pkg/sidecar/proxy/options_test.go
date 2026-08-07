@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/require"
@@ -42,34 +43,36 @@ func createConfigWithValidYAML(t *testing.T) string {
 	t.Helper()
 	return writeTempYAML(t, "valid.yaml", fmt.Sprintf(`
 port: 8100
-vllm-port: 8200
+model-server-port: 8001
 data-parallel-size: 5
 kv-connector: %q
-connector: %q
 ec-connector: %q
 enable-ssrf-protection: true
 enable-prefiller-sampling: true
+enable-p2p-pull: true
 enable-tls:
 - prefiller
 - decoder
-prefiller-use-tls: false
 tls-insecure-skip-verify:
 - prefiller
-decoder-tls-insecure-skip-verify: true
 secure-proxy: false
 cert-path: "/etc/certificates-file"
 inference-pool: "file-ns/inference-pool-file"
 pool-group: "pool-group-file"
 max-idle-conns-per-host: 300
+prefill-max-retries: 3
+prefill-retry-backoff: "500ms"
 decode-chunk-size: 128
-`, KVConnectorSGLang, KVConnectorNIXLV2, ECExampleConnector))
+mooncake-bootstrap-port: 9000
+tracing: true
+`, KVConnectorNIXLV2, ECExampleConnector))
 }
 
 func createConfigWithUnknownKeys(t *testing.T) string {
 	t.Helper()
 	return writeTempYAML(t, "valid.yaml", `
 port: 8100
-vllm-port: 8200
+model-server-port: 8001
 unknown-key: 1001
 `)
 }
@@ -86,25 +89,26 @@ func TestSidecarConfiguration(t *testing.T) {
 	// --- inline YAML for testing ---
 	inlineYAML := fmt.Sprintf(`{
 		port: 8011,
-		vllm-port: 8021,
+		model-server-port: 8021,
 		data-parallel-size: 3,
 		kv-connector: %s,
-		connector: %s,
 		ec-connector: %s,
 		enable-ssrf-protection: true,
 		enable-prefiller-sampling: true,
+		enable-p2p-pull: true,
 		enable-tls: ['prefiller', 'decoder'],
-		prefiller-use-tls: false,
-		decoder-use-tls: true,
 		tls-insecure-skip-verify: ['decoder'],
-		prefiller-tls-insecure-skip-verify: true,
 		secure-proxy: false,
 		cert-path: '/etc/certificates-inline',
 		inference-pool: inline-ns/inference-pool-inline,
 		pool-group: pool-group-inline,
 		max-idle-conns-per-host: 200,
-		decode-chunk-size: 256
-	}`, KVConnectorSGLang, KVConnectorNIXLV2, ECExampleConnector)
+		prefill-max-retries: 2,
+		prefill-retry-backoff: '300ms',
+		decode-chunk-size: 256,
+		mooncake-bootstrap-port: 9001,
+		tracing: true
+	}`, KVConnectorNIXLV2, ECExampleConnector)
 	invalidInlineYAML := "{port: 8200, invalid-yaml}"
 
 	// -- file YAML for testing ---
@@ -126,24 +130,25 @@ func TestSidecarConfiguration(t *testing.T) {
 			},
 			expected: func(o *Options) {
 				o.Port = "8011"
-				o.vllmPort = "8021"
+				o.modelServerPort = "8021"
 				o.DataParallelSize = 3
 				o.MaxIdleConnsPerHost = 200
+				o.MooncakeBootstrapPort = 9001
 
-				o.KVConnector = KVConnectorSGLang
-				o.connector = KVConnectorNIXLV2
+				o.KVConnector = KVConnectorNIXLV2
 				o.ECConnector = ECExampleConnector
 
 				o.EnableSSRFProtection = true
 				o.EnablePrefillerSampling = true
+				o.EnableP2PPull = true
 
 				o.enableTLS = []string{prefillStage, decodeStage}
 				o.UseTLSForPrefiller = true
 				o.UseTLSForDecoder = true
 				o.UseTLSForEncoder = false
 
-				o.tlsInsecureSkipVerify = []string{prefillStage, decodeStage}
-				o.InsecureSkipVerifyForPrefiller = true
+				o.tlsInsecureSkipVerify = []string{decodeStage}
+				o.InsecureSkipVerifyForPrefiller = false
 				o.InsecureSkipVerifyForDecoder = true
 				o.InsecureSkipVerifyForEncoder = false
 
@@ -155,7 +160,11 @@ func TestSidecarConfiguration(t *testing.T) {
 				o.InferencePoolName = "inference-pool-inline"
 				o.PoolGroup = "pool-group-inline"
 
+				o.PrefillMaxRetries = 2
+				o.PrefillRetryBackoff = 300 * time.Millisecond
+
 				o.DecodeChunkSize = 256
+				o.Tracing = true
 
 				o.inlineConfiguration = inlineYAML
 				o.fileConfiguration = ""
@@ -169,24 +178,26 @@ func TestSidecarConfiguration(t *testing.T) {
 			},
 			expected: func(o *Options) {
 				o.Port = "8100"
-				o.vllmPort = "8200"
+				o.modelServerPort = "8001"
 				o.DataParallelSize = 5
 				o.MaxIdleConnsPerHost = 300
+				o.MooncakeBootstrapPort = 9000
 
-				o.KVConnector = KVConnectorSGLang
+				o.KVConnector = KVConnectorNIXLV2
 				o.ECConnector = ECExampleConnector
 
 				o.EnableSSRFProtection = true
 				o.EnablePrefillerSampling = true
+				o.EnableP2PPull = true
 
 				o.enableTLS = []string{prefillStage, decodeStage}
 				o.UseTLSForPrefiller = true
 				o.UseTLSForDecoder = true
 				o.UseTLSForEncoder = false
 
-				o.tlsInsecureSkipVerify = []string{prefillStage, decodeStage}
+				o.tlsInsecureSkipVerify = []string{prefillStage}
 				o.InsecureSkipVerifyForPrefiller = true
-				o.InsecureSkipVerifyForDecoder = true
+				o.InsecureSkipVerifyForDecoder = false
 				o.InsecureSkipVerifyForEncoder = false
 
 				o.SecureServing = false
@@ -197,7 +208,11 @@ func TestSidecarConfiguration(t *testing.T) {
 				o.InferencePoolName = "inference-pool-file"
 				o.PoolGroup = "pool-group-file"
 
+				o.PrefillMaxRetries = 3
+				o.PrefillRetryBackoff = 500 * time.Millisecond
+
 				o.DecodeChunkSize = 128
+				o.Tracing = true
 
 				o.inlineConfiguration = ""
 				o.fileConfiguration = validYAMLPath
@@ -208,9 +223,9 @@ func TestSidecarConfiguration(t *testing.T) {
 			name: "flags override inline YAML",
 			inputFlags: map[string]any{
 				port:                    "8111",
-				vllmPort:                "8222",
+				modelServerPort:         "8222",
 				dataParallelSize:        2,
-				kvConnector:             KVConnectorSGLang,
+				kvConnector:             KVConnectorNIXLV2,
 				ecConnector:             ECExampleConnector,
 				enableSSRFProtection:    true,
 				enablePrefillerSampling: true,
@@ -220,19 +235,22 @@ func TestSidecarConfiguration(t *testing.T) {
 				certPath:                "/etc/certificates",
 				inferencePool:           "ns/inference-pool",
 				poolGroup:               "pool-group",
+				enableP2PPull:           false, // overrides enable-p2p-pull: true in the inline YAML
 				inlineConfiguration:     &inlineYAML,
 			},
 			expected: func(o *Options) {
 				o.Port = "8111"
-				o.vllmPort = "8222"
+				o.modelServerPort = "8222"
 				o.DataParallelSize = 2
 				o.MaxIdleConnsPerHost = 200
+				o.MooncakeBootstrapPort = 9001
 
-				o.KVConnector = KVConnectorSGLang
+				o.KVConnector = KVConnectorNIXLV2
 				o.ECConnector = ECExampleConnector
 
 				o.EnableSSRFProtection = true
 				o.EnablePrefillerSampling = true
+				o.EnableP2PPull = false
 
 				o.enableTLS = []string{prefillStage}
 				o.UseTLSForPrefiller = true
@@ -252,7 +270,11 @@ func TestSidecarConfiguration(t *testing.T) {
 				o.InferencePoolName = "inference-pool"
 				o.PoolGroup = "pool-group"
 
+				o.PrefillMaxRetries = 2
+				o.PrefillRetryBackoff = 300 * time.Millisecond
+
 				o.DecodeChunkSize = 256
+				o.Tracing = true
 
 				o.inlineConfiguration = inlineYAML
 				o.fileConfiguration = ""
@@ -260,35 +282,50 @@ func TestSidecarConfiguration(t *testing.T) {
 			expectedError: nil,
 		},
 		{
+			name: "flags set ECConnectorNIXL",
+			inputFlags: map[string]any{
+				ecConnector: ECConnectorNIXL,
+			},
+			expected: func(o *Options) {
+				o.modelServerPort = defaultVLLMPort
+				o.KVConnector = KVConnectorNIXLV2
+				o.ECConnector = ECConnectorNIXL
+			},
+			expectedError: nil,
+		},
+		{
 			name: "flags override file YAML",
 			inputFlags: map[string]any{
-				port:                    "8111",
-				vllmPort:                "8222",
-				dataParallelSize:        2,
-				kvConnector:             KVConnectorSGLang,
-				ecConnector:             ECExampleConnector,
-				enableSSRFProtection:    true,
-				enablePrefillerSampling: true,
-				enableTLS:               &[]string{prefillStage},
-				tlsInsecureSkipVerify:   &[]string{prefillStage},
-				secureServing:           false,
-				certPath:                "/etc/certificates",
-				inferencePool:           "ns/inference-pool",
-				poolGroup:               "pool-group",
-				configurationFile:       validYAMLPath,
-				maxIdleConnsPerHost:     400,
+				port:                      "8111",
+				modelServerPort:           "8222",
+				dataParallelSize:          2,
+				kvConnector:               KVConnectorNIXLV2,
+				ecConnector:               ECExampleConnector,
+				enableSSRFProtection:      true,
+				enablePrefillerSampling:   true,
+				enableTLS:                 &[]string{prefillStage},
+				tlsInsecureSkipVerify:     &[]string{prefillStage},
+				secureServing:             false,
+				certPath:                  "/etc/certificates",
+				inferencePool:             "ns/inference-pool",
+				poolGroup:                 "pool-group",
+				configurationFile:         validYAMLPath,
+				maxIdleConnsPerHost:       400,
+				mooncakeBootstrapPortFlag: 9002,
 			},
 			expected: func(o *Options) {
 				o.Port = "8111"
-				o.vllmPort = "8222"
+				o.modelServerPort = "8222"
 				o.DataParallelSize = 2
 				o.MaxIdleConnsPerHost = 400
+				o.MooncakeBootstrapPort = 9002
 
-				o.KVConnector = KVConnectorSGLang
+				o.KVConnector = KVConnectorNIXLV2
 				o.ECConnector = ECExampleConnector
 
 				o.EnableSSRFProtection = true
 				o.EnablePrefillerSampling = true
+				o.EnableP2PPull = true
 
 				o.enableTLS = []string{prefillStage}
 				o.UseTLSForPrefiller = true
@@ -308,7 +345,11 @@ func TestSidecarConfiguration(t *testing.T) {
 				o.InferencePoolName = "inference-pool"
 				o.PoolGroup = "pool-group"
 
+				o.PrefillMaxRetries = 3
+				o.PrefillRetryBackoff = 500 * time.Millisecond
+
 				o.DecodeChunkSize = 128
+				o.Tracing = true
 
 				o.inlineConfiguration = ""
 				o.fileConfiguration = validYAMLPath
@@ -333,6 +374,13 @@ func TestSidecarConfiguration(t *testing.T) {
 			name: "unknown keys in YAML",
 			inputFlags: map[string]any{
 				configurationFile: unknownKeysYAMLPath,
+			},
+			expectedError: errors.New("failed to unmarshal sidecar configuration"),
+		},
+		{
+			name: "removed connector key in YAML is rejected",
+			inputFlags: map[string]any{
+				inlineConfiguration: "{port: 8011, connector: nixlv2}",
 			},
 			expectedError: errors.New("failed to unmarshal sidecar configuration"),
 		},
@@ -406,7 +454,7 @@ func compareOptions(t *testing.T, expected, actual *Options) {
 	}
 
 	assertEqual(port, expected.Port, actual.Port)
-	assertEqual(vllmPort, expected.vllmPort, actual.vllmPort)
+	assertEqual(modelServerPort, expected.modelServerPort, actual.modelServerPort)
 	assertEqual(dataParallelSize, expected.DataParallelSize, actual.DataParallelSize)
 	assertEqual(maxIdleConnsPerHost, expected.MaxIdleConnsPerHost, actual.MaxIdleConnsPerHost)
 
@@ -415,13 +463,14 @@ func compareOptions(t *testing.T, expected, actual *Options) {
 
 	assertEqual(enableSSRFProtection, expected.EnableSSRFProtection, actual.EnableSSRFProtection)
 	assertEqual(enablePrefillerSampling, expected.EnablePrefillerSampling, actual.EnablePrefillerSampling)
+	assertEqual(enableP2PPull, expected.EnableP2PPull, actual.EnableP2PPull)
 
-	assertEqual(prefillerUseTLS, expected.UseTLSForPrefiller, actual.UseTLSForPrefiller)
-	assertEqual(decoderUseTLS, expected.UseTLSForDecoder, actual.UseTLSForDecoder)
-	assertEqual(encoderUseTLS, expected.UseTLSForEncoder, actual.UseTLSForEncoder)
+	assertEqual("UseTLSForPrefiller", expected.UseTLSForPrefiller, actual.UseTLSForPrefiller)
+	assertEqual("UseTLSForDecoder", expected.UseTLSForDecoder, actual.UseTLSForDecoder)
+	assertEqual("UseTLSForEncoder", expected.UseTLSForEncoder, actual.UseTLSForEncoder)
 
-	assertEqual(prefillerTLSInsecureSkipVerify, expected.InsecureSkipVerifyForPrefiller, actual.InsecureSkipVerifyForPrefiller)
-	assertEqual(decoderTLSInsecureSkipVerify, expected.InsecureSkipVerifyForDecoder, actual.InsecureSkipVerifyForDecoder)
+	assertEqual("InsecureSkipVerifyForPrefiller", expected.InsecureSkipVerifyForPrefiller, actual.InsecureSkipVerifyForPrefiller)
+	assertEqual("InsecureSkipVerifyForDecoder", expected.InsecureSkipVerifyForDecoder, actual.InsecureSkipVerifyForDecoder)
 	assertEqual("InsecureSkipVerifyForEncoder", expected.InsecureSkipVerifyForEncoder, actual.InsecureSkipVerifyForEncoder)
 
 	assertSlice(enableTLS, expected.enableTLS, actual.enableTLS)
@@ -435,12 +484,16 @@ func compareOptions(t *testing.T, expected, actual *Options) {
 	assertEqual("InferencePoolName", expected.InferencePoolName, actual.InferencePoolName)
 	assertEqual(poolGroup, expected.PoolGroup, actual.PoolGroup)
 
+	assertEqual(prefillMaxRetries, expected.PrefillMaxRetries, actual.PrefillMaxRetries)
+	assertEqual(prefillRetryBackoff, expected.PrefillRetryBackoff, actual.PrefillRetryBackoff)
+
 	assertEqual(decodeChunkSize, expected.DecodeChunkSize, actual.DecodeChunkSize)
+	assertEqual(tracingFlag, expected.Tracing, actual.Tracing)
 
 	assertEqual(inlineConfiguration, expected.inlineConfiguration, actual.inlineConfiguration)
 	assertEqual(configurationFile, expected.fileConfiguration, actual.fileConfiguration)
 
-	assertEqual("decoderURL", calculateURL(t, expected.UseTLSForDecoder, expected.vllmPort), actual.DecoderURL)
+	assertEqual("decoderURL", calculateURL(t, expected.UseTLSForDecoder, expected.modelServerPort), actual.DecoderURL)
 }
 
 // setEnv sets environment variables for testing and ensures they are cleaned up after the test finishes
@@ -537,6 +590,7 @@ func TestNewOptionsWithEnvVars(t *testing.T) {
 	opts := NewOptions()
 	require.NoError(t, opts.Complete())
 
+	require.False(t, opts.Tracing, "Expected Tracing to default to false")
 	if opts.InferencePoolNamespace != "test-namespace" {
 		t.Errorf("Expected InferencePoolNamespace to be 'test-namespace', got '%s'", opts.InferencePoolNamespace)
 	}
@@ -548,6 +602,92 @@ func TestNewOptionsWithEnvVars(t *testing.T) {
 	}
 }
 
+func TestP2PConnectorPort(t *testing.T) {
+	t.Run("defaults to 7777", func(t *testing.T) {
+		opts := NewOptions()
+		require.NoError(t, opts.Complete())
+		require.NoError(t, opts.Validate())
+		require.Equal(t, defaultP2PConnectorPort, opts.P2PConnectorPort)
+	})
+
+	t.Run("env var overrides default", func(t *testing.T) {
+		t.Setenv(envP2PConnectorPort, "9500")
+		opts := NewOptions()
+		require.NoError(t, opts.Complete())
+		require.NoError(t, opts.Validate())
+		require.Equal(t, 9500, opts.P2PConnectorPort)
+	})
+
+	t.Run("rejects out-of-range port", func(t *testing.T) {
+		opts := NewOptions()
+		opts.P2PConnectorPort = 70000
+		require.NoError(t, opts.Complete())
+		require.ErrorContains(t, opts.Validate(), "--p2p-connector-port must be between 1 and 65535")
+	})
+}
+
+func TestValidateOffloadingDP(t *testing.T) {
+	t.Run("allows offloading with data-parallel-size > 1", func(t *testing.T) {
+		opts := NewOptions()
+		opts.KVConnector = KVConnectorOffloading
+		opts.DataParallelSize = 2
+		require.NoError(t, opts.Complete())
+		require.NoError(t, opts.Validate())
+	})
+
+	t.Run("allows offloading with data-parallel-size 1", func(t *testing.T) {
+		opts := NewOptions()
+		opts.KVConnector = KVConnectorOffloading
+		opts.DataParallelSize = 1
+		require.NoError(t, opts.Complete())
+		require.NoError(t, opts.Validate())
+	})
+
+	t.Run("rejects a rank port beyond 65535", func(t *testing.T) {
+		opts := NewOptions()
+		opts.KVConnector = KVConnectorOffloading
+		opts.DataParallelSize = 4
+		opts.P2PConnectorPort = 65533
+		require.NoError(t, opts.Complete())
+		require.ErrorContains(t, opts.Validate(), "exceeds 65535")
+	})
+
+	t.Run("allows the highest rank port at 65535", func(t *testing.T) {
+		opts := NewOptions()
+		opts.KVConnector = KVConnectorOffloading
+		opts.DataParallelSize = 4
+		opts.P2PConnectorPort = 65532
+		require.NoError(t, opts.Complete())
+		require.NoError(t, opts.Validate())
+	})
+}
+
+func TestValidateEnableP2PPull(t *testing.T) {
+	t.Run("rejects enable-p2p-pull with non-NIXLv2 connector", func(t *testing.T) {
+		opts := NewOptions()
+		opts.KVConnector = KVConnectorSharedStorage
+		opts.EnableP2PPull = true
+		require.NoError(t, opts.Complete())
+		require.ErrorContains(t, opts.Validate(), "--enable-p2p-pull requires --kv-connector=nixlv2")
+	})
+
+	t.Run("rejects enable-p2p-pull with offloading connector", func(t *testing.T) {
+		opts := NewOptions()
+		opts.KVConnector = KVConnectorOffloading
+		opts.EnableP2PPull = true
+		require.NoError(t, opts.Complete())
+		require.ErrorContains(t, opts.Validate(), "--enable-p2p-pull requires --kv-connector=nixlv2")
+	})
+
+	t.Run("allows enable-p2p-pull with NIXLv2 connector", func(t *testing.T) {
+		opts := NewOptions()
+		opts.KVConnector = KVConnectorNIXLV2
+		opts.EnableP2PPull = true
+		require.NoError(t, opts.Complete())
+		require.NoError(t, opts.Validate())
+	})
+}
+
 func TestValidateConnector(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -557,13 +697,15 @@ func TestValidateConnector(t *testing.T) {
 		{"valid nixlv2", KVConnectorNIXLV2, false},
 		{"valid shared-storage", KVConnectorSharedStorage, false},
 		{"valid sglang", KVConnectorSGLang, false},
+		{"valid mooncake", KVConnectorMooncake, false},
+		{"valid offloading", KVConnectorOffloading, false},
 		{"invalid connector", "invalid", true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			opts := NewOptions()
-			opts.connector = tt.connector
+			opts.KVConnector = tt.connector
 			_ = opts.Complete() // Complete must be called before Validate
 			err := opts.Validate()
 			if (err != nil) != tt.wantErr {
@@ -629,6 +771,119 @@ func TestValidateSSRFProtection(t *testing.T) {
 	}
 }
 
+func TestValidateDataParallelSize(t *testing.T) {
+	tests := []struct {
+		name             string
+		dataParallelSize int
+		wantErr          bool
+	}{
+		{"default valid", 1, false},
+		{"positive valid", 2, false},
+		{"zero invalid", 0, true},
+		{"negative invalid", -5, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := NewOptions()
+			opts.DataParallelSize = tt.dataParallelSize
+			_ = opts.Complete()
+			err := opts.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateDataParallelPortRange(t *testing.T) {
+	tests := []struct {
+		name             string
+		port             string
+		modelServerPort  string
+		dataParallelSize int
+		wantErr          bool
+	}{
+		{"derived ports valid", "65534", "65534", 2, false},
+		{"derived sidecar port too high", "65535", "8000", 2, true},
+		{"derived vLLM port too high", "8000", "65535", 2, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := NewOptions()
+			opts.Port = tt.port
+			opts.modelServerPort = tt.modelServerPort
+			opts.DataParallelSize = tt.dataParallelSize
+			_ = opts.Complete()
+			err := opts.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidatePorts(t *testing.T) {
+	tests := []struct {
+		name            string
+		port            string
+		modelServerPort string
+		wantErr         string
+	}{
+		{"valid ports", "8000", "8001", ""},
+		{"invalid port format", "abc", "8001", `--port must be a valid integer, got "abc"`},
+		{"invalid model server port format", "8000", "xyz", `--model-server-port must be a valid integer, got "xyz"`},
+		{"port too low", "0", "8001", "--port start port 0 is out of valid range [1, 65535]"},
+		{"port too high", "65536", "8001", "--port start port 65536 is out of valid range [1, 65535]"},
+		{"model server port too low", "8000", "0", "--model-server-port start port 0 is out of valid range [1, 65535]"},
+		{"model server port too high", "8000", "65536", "--model-server-port start port 65536 is out of valid range [1, 65535]"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := NewOptions()
+			opts.Port = tt.port
+			opts.modelServerPort = tt.modelServerPort
+			_ = opts.Complete()
+			err := opts.Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.EqualError(t, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidatePortRange(t *testing.T) {
+	tests := []struct {
+		name      string
+		startPort int
+		rangeSize int
+		wantErr   string
+	}{
+		{"valid range", 1, 65534, ""},
+		{"zero range size", 1, 0, "invalid port range"},
+		{"range size at maximum", 1, 65535, "invalid port range"},
+		{"range size too large", 1, 65536, "invalid port range"},
+		{"start port too low", 0, 1, "start port 0 is out of valid range [1, 65535]"},
+		{"start port too high", 65536, 1, "start port 65536 is out of valid range [1, 65535]"},
+		{"end port too high", 65535, 2, "port range [65535, 65536] exceeds maximum port value"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validatePortRange(tt.startPort, tt.rangeSize)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.EqualError(t, err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestCompleteInferencePoolParsing(t *testing.T) {
 	tests := []struct {
 		name              string
@@ -682,16 +937,279 @@ func TestCompleteInferencePoolParsing(t *testing.T) {
 	}
 }
 
+// TestValidateWideEPHosts covers the multi-pod Wide-EP fan-out invariants
+// (2P2D DP=EP=16) introduced by the Wide-EP fan-out commit.  vLLM maps every
+// global DP rank to a pod via pod_idx = dp_rank / dp_size_local and indexes
+// hosts[pod_idx], so the helper must reject any host-list / dp-size-local
+// combination that would leave a DP rank unmapped or divide by zero -- while
+// tolerating the single-pod degenerate cases (0 or 1 host) so the same
+// templated flag works on a 1P1D overlay.
+func TestValidateWideEPHosts(t *testing.T) {
+	tests := []struct {
+		name    string
+		flag    string
+		hosts   []string
+		dpSize  int
+		dpLocal int
+		wantErr string // substring; "" means expect nil
+	}{
+		{
+			name:    "2P2D DP16 valid (2 pods, local 8)",
+			flag:    "--moriio-decode-hosts",
+			hosts:   []string{testDecodeHostIP, testDecodeHostIP2},
+			dpSize:  16,
+			dpLocal: 8,
+			wantErr: "",
+		},
+		{
+			name:    "empty host list is single-pod, skipped",
+			flag:    "--moriio-remote-hosts",
+			hosts:   nil,
+			dpSize:  8,
+			dpLocal: 0,
+			wantErr: "",
+		},
+		{
+			name:    "single host is degenerate, tolerated",
+			flag:    "--moriio-remote-hosts",
+			hosts:   []string{testPrefillHostIP1},
+			dpSize:  8,
+			dpLocal: 0,
+			wantErr: "",
+		},
+		{
+			name:    "multi-pod missing dp-size-local",
+			flag:    "--moriio-remote-hosts",
+			hosts:   []string{testPrefillHostIP1, testPrefillHostIP2},
+			dpSize:  16,
+			dpLocal: 0,
+			wantErr: "requires dp-size-local > 0",
+		},
+		{
+			name:    "dp-size not divisible by dp-size-local",
+			flag:    "--moriio-decode-hosts",
+			hosts:   []string{testDecodeHostIP, testDecodeHostIP2},
+			dpSize:  15,
+			dpLocal: 8,
+			wantErr: "must be divisible",
+		},
+		{
+			name:    "host count does not match pod count",
+			flag:    "--moriio-remote-hosts",
+			hosts:   []string{testPrefillHostIP1, testPrefillHostIP2, "10.0.0.3"},
+			dpSize:  16,
+			dpLocal: 8,
+			wantErr: "dp-size/dp-size-local = 2",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateWideEPHosts(tt.flag, tt.hosts, tt.dpSize, tt.dpLocal)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.wantErr)
+			// Error text must name the offending flag so operators can act.
+			require.Contains(t, err.Error(), tt.flag[:len("--moriio-")])
+		})
+	}
+}
+
+// TestCompleteWideEPValidation drives the Wide-EP validation through
+// Options.Complete() to confirm BOTH host-list legs are checked and a valid
+// 2P2D config passes end-to-end.
+func TestCompleteWideEPValidation(t *testing.T) {
+	// Skip when MoRI-IO feature is dormant since all test cases set MoRI-IO
+	// flags that will be rejected by the dormant feature gate.
+	if !MoRIIOFeatureEnabled {
+		t.Skip("MoRI-IO feature is dormant; skipping Wide-EP validation tests")
+	}
+	tests := []struct {
+		name        string
+		remoteHosts []string
+		decodeHosts []string
+		dpSize      int
+		dpLocal     int
+		wantErr     string
+	}{
+		{
+			name:        "valid 2P2D DP16 both legs",
+			remoteHosts: []string{testLocalHostname, testLocalHostname},
+			decodeHosts: []string{testLocalHostname, testLocalHostname},
+			dpSize:      16,
+			dpLocal:     8,
+			wantErr:     "",
+		},
+		{
+			name:        "1P1D DP8 single-pod (no host lists) passes",
+			remoteHosts: nil,
+			decodeHosts: nil,
+			dpSize:      8,
+			dpLocal:     0,
+			wantErr:     "",
+		},
+		{
+			name:        "remote-hosts leg invalid",
+			remoteHosts: []string{testPrefillHostIP1, testPrefillHostIP2},
+			decodeHosts: nil,
+			dpSize:      16,
+			dpLocal:     0,
+			wantErr:     "--moriio-remote-hosts",
+		},
+		{
+			name:        "decode-hosts leg invalid",
+			remoteHosts: nil,
+			decodeHosts: []string{testDecodeHostIP, testDecodeHostIP2, testDecodeHostIP3},
+			dpSize:      16,
+			dpLocal:     8,
+			wantErr:     "--moriio-decode-hosts",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := NewOptions()
+			opts.MoRIIORemoteHosts = tt.remoteHosts
+			opts.MoRIIODecodeHosts = tt.decodeHosts
+			opts.MoRIIODPSize = tt.dpSize
+			opts.MoRIIODPSizeLocal = tt.dpLocal
+
+			err := opts.Complete()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+// TestCompleteMoRIIOWriteModeGuards covers the WRITE-mode / parallel-dispatch
+// preconditions added by the WRITE-mode sidecar commit: WRITE mode needs a
+// routable decode pod IP, and concurrent dispatch is WRITE-mode-only.
+func TestCompleteMoRIIOWriteModeGuards(t *testing.T) {
+	// When MoRIIOFeatureEnabled is false (dormant), ALL MoRI-IO flags should
+	// be rejected with the dormant feature message.
+	if !MoRIIOFeatureEnabled {
+		t.Run("dormant feature rejects write-mode", func(t *testing.T) {
+			opts := NewOptions()
+			opts.MoRIIOWriteMode = true
+			opts.MoRIIODecodePodIP = testDecodeHostIP
+			err := opts.Complete()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "not yet enabled")
+		})
+		t.Run("dormant feature rejects dp-size > 1", func(t *testing.T) {
+			opts := NewOptions()
+			opts.MoRIIODPSize = 8 // non-default, affects routing
+			err := opts.Complete()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "not yet enabled")
+		})
+		t.Run("dormant feature rejects remote-hosts", func(t *testing.T) {
+			opts := NewOptions()
+			opts.MoRIIORemoteHosts = []string{testPrefillHostIP1, testPrefillHostIP2}
+			opts.MoRIIODPSize = 16
+			opts.MoRIIODPSizeLocal = 8
+			err := opts.Complete()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "not yet enabled")
+		})
+		t.Run("dormant feature rejects dp-size-local > 0", func(t *testing.T) {
+			opts := NewOptions()
+			opts.MoRIIODPSizeLocal = 8
+			err := opts.Complete()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "not yet enabled")
+		})
+		t.Skip("MoRI-IO feature is dormant; skipping enabled-mode tests")
+	}
+
+	t.Run("write-mode without pod IP errors", func(t *testing.T) {
+		opts := NewOptions()
+		opts.MoRIIOWriteMode = true
+		opts.MoRIIODecodePodIP = ""
+		require.ErrorContains(t, opts.Complete(), "--moriio-local-pod-ip")
+	})
+
+	t.Run("write-mode with pod IP passes", func(t *testing.T) {
+		opts := NewOptions()
+		opts.MoRIIOWriteMode = true
+		opts.MoRIIODecodePodIP = testDecodeHostIP
+		require.NoError(t, opts.Complete())
+	})
+
+	t.Run("parallel-dispatch requires write-mode", func(t *testing.T) {
+		opts := NewOptions()
+		opts.MoRIIOParallelDispatch = true
+		opts.MoRIIOWriteMode = false
+		require.ErrorContains(t, opts.Complete(), "--moriio-write-mode")
+	})
+}
+
+// TestModelServerPortMigration verifies that the deprecated vllm-port flag
+// migrates to model-server-port.
+// Remove when vllm-port is dropped in v0.12 (see issue 2172).
+func TestModelServerPortMigration(t *testing.T) {
+	tests := []struct {
+		name               string
+		modelServerPort    string
+		vllmPort           string
+		expectedDecoderURL string
+	}{
+		{"model-server-port set", "9000", "", "http://localhost:9000"},
+		{"deprecated vllm-port migrated", "", "9001", "http://localhost:9001"},
+		{"model-server-port wins over vllm-port when both set", "9000", "9001", "http://localhost:9000"},
+		{"no model-server-port, default falls back to vllm-port default", "", defaultVLLMPort, "http://localhost:" + defaultVLLMPort},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := NewOptions()
+			opts.modelServerPort = tt.modelServerPort
+			opts.vllmPort = tt.vllmPort
+
+			require.NoError(t, opts.Complete())
+			require.NoError(t, opts.Validate())
+			require.NotNil(t, opts.DecoderURL)
+			require.Equal(t, tt.expectedDecoderURL, opts.DecoderURL.String())
+		})
+	}
+}
+
+func TestModelServerPortYAML(t *testing.T) {
+	opts, testPFlagSet := newTestOptions(t)
+	yaml := "{model-server-port: 8203}"
+	setFlag(t, testPFlagSet, inlineConfiguration, &yaml)
+	require.NoError(t, testPFlagSet.Parse(nil))
+
+	require.NoError(t, opts.Complete())
+	require.NoError(t, opts.Validate())
+	require.Equal(t, "http://localhost:8203", opts.DecoderURL.String())
+}
+
+// A CLI flag overrides YAML config, including the deprecated --vllm-port over a
+// model-server-port key.
+func TestModelServerPortFlagBeatsYAML(t *testing.T) {
+	opts, testPFlagSet := newTestOptions(t)
+	yaml := "{model-server-port: 8203}"
+	setFlag(t, testPFlagSet, inlineConfiguration, &yaml)
+	setFlag(t, testPFlagSet, vllmPort, "9001")
+	require.NoError(t, testPFlagSet.Parse(nil))
+
+	require.NoError(t, opts.Complete())
+	require.NoError(t, opts.Validate())
+	require.Equal(t, "http://localhost:9001", opts.DecoderURL.String())
+}
+
 func TestCompleteTLSConfiguration(t *testing.T) {
 	tests := []struct {
 		name                         string
 		enableTLS                    []string
 		tlsInsecureSkipVerify        []string
-		deprecatedPrefillerUseTLS    bool
-		deprecatedDecoderUseTLS      bool
-		deprecatedPrefillerInsecure  bool
-		deprecatedDecoderInsecure    bool
-		vllmPort                     string
+		modelServerPort              string
 		expectedDecoderURL           string
 		expectedUseTLSForPrefiller   bool
 		expectedUseTLSForDecoder     bool
@@ -702,7 +1220,7 @@ func TestCompleteTLSConfiguration(t *testing.T) {
 			name:                         "no TLS configuration",
 			enableTLS:                    []string{},
 			tlsInsecureSkipVerify:        []string{},
-			vllmPort:                     "8001",
+			modelServerPort:              "8001",
 			expectedDecoderURL:           "http://localhost:8001",
 			expectedUseTLSForPrefiller:   false,
 			expectedUseTLSForDecoder:     false,
@@ -713,7 +1231,7 @@ func TestCompleteTLSConfiguration(t *testing.T) {
 			name:                         "prefiller TLS only",
 			enableTLS:                    []string{"prefiller"},
 			tlsInsecureSkipVerify:        []string{},
-			vllmPort:                     "8001",
+			modelServerPort:              "8001",
 			expectedDecoderURL:           "http://localhost:8001",
 			expectedUseTLSForPrefiller:   true,
 			expectedUseTLSForDecoder:     false,
@@ -724,7 +1242,7 @@ func TestCompleteTLSConfiguration(t *testing.T) {
 			name:                         "decoder TLS only",
 			enableTLS:                    []string{"decoder"},
 			tlsInsecureSkipVerify:        []string{},
-			vllmPort:                     "8001",
+			modelServerPort:              "8001",
 			expectedDecoderURL:           "https://localhost:8001",
 			expectedUseTLSForPrefiller:   false,
 			expectedUseTLSForDecoder:     true,
@@ -735,7 +1253,7 @@ func TestCompleteTLSConfiguration(t *testing.T) {
 			name:                         "both stages TLS",
 			enableTLS:                    []string{"prefiller", "decoder"},
 			tlsInsecureSkipVerify:        []string{},
-			vllmPort:                     "9000",
+			modelServerPort:              "9000",
 			expectedDecoderURL:           "https://localhost:9000",
 			expectedUseTLSForPrefiller:   true,
 			expectedUseTLSForDecoder:     true,
@@ -746,39 +1264,11 @@ func TestCompleteTLSConfiguration(t *testing.T) {
 			name:                         "TLS with insecure skip verify",
 			enableTLS:                    []string{"prefiller", "decoder"},
 			tlsInsecureSkipVerify:        []string{"prefiller", "decoder"},
-			vllmPort:                     "8001",
+			modelServerPort:              "8001",
 			expectedDecoderURL:           "https://localhost:8001",
 			expectedUseTLSForPrefiller:   true,
 			expectedUseTLSForDecoder:     true,
 			expectedInsecureForPrefiller: true,
-			expectedInsecureForDecoder:   true,
-		},
-		{
-			name:                         "deprecated flags migration",
-			enableTLS:                    []string{},
-			tlsInsecureSkipVerify:        []string{},
-			deprecatedPrefillerUseTLS:    true,
-			deprecatedDecoderUseTLS:      true,
-			deprecatedPrefillerInsecure:  true,
-			deprecatedDecoderInsecure:    true,
-			vllmPort:                     "8001",
-			expectedDecoderURL:           "https://localhost:8001",
-			expectedUseTLSForPrefiller:   true,
-			expectedUseTLSForDecoder:     true,
-			expectedInsecureForPrefiller: true,
-			expectedInsecureForDecoder:   true,
-		},
-		{
-			name:                         "mixed deprecated and new flags",
-			enableTLS:                    []string{"prefiller"},
-			tlsInsecureSkipVerify:        []string{},
-			deprecatedDecoderUseTLS:      true,
-			deprecatedDecoderInsecure:    true,
-			vllmPort:                     "8001",
-			expectedDecoderURL:           "https://localhost:8001",
-			expectedUseTLSForPrefiller:   true,
-			expectedUseTLSForDecoder:     true,
-			expectedInsecureForPrefiller: false,
 			expectedInsecureForDecoder:   true,
 		},
 	}
@@ -788,11 +1278,7 @@ func TestCompleteTLSConfiguration(t *testing.T) {
 			opts := NewOptions()
 			opts.enableTLS = tt.enableTLS
 			opts.tlsInsecureSkipVerify = tt.tlsInsecureSkipVerify
-			opts.prefillerUseTLS = tt.deprecatedPrefillerUseTLS
-			opts.decoderUseTLS = tt.deprecatedDecoderUseTLS
-			opts.prefillerInsecureSkipVerify = tt.deprecatedPrefillerInsecure
-			opts.decoderInsecureSkipVerify = tt.deprecatedDecoderInsecure
-			opts.vllmPort = tt.vllmPort
+			opts.modelServerPort = tt.modelServerPort
 
 			err := opts.Complete()
 			if err != nil {
@@ -818,4 +1304,265 @@ func TestCompleteTLSConfiguration(t *testing.T) {
 
 		})
 	}
+}
+
+// TestResolveHostsToIPs tests the DNS resolution helper function that
+// automatically converts hostnames to IP addresses at startup, enabling
+// LWS-compatible pod addressing (DNS names instead of hardcoded IPs).
+func TestResolveHostsToIPs(t *testing.T) {
+	t.Run("empty list returns empty", func(t *testing.T) {
+		result, err := resolveHostsToIPs(nil)
+		require.NoError(t, err)
+		require.Empty(t, result)
+
+		result, err = resolveHostsToIPs([]string{})
+		require.NoError(t, err)
+		require.Empty(t, result)
+	})
+
+	t.Run("raw IPv4 addresses are passed through", func(t *testing.T) {
+		hosts := []string{testPrefillHostIP1}
+		result, err := resolveHostsToIPs(hosts)
+		require.NoError(t, err)
+		require.Equal(t, []string{testPrefillHostIP1}, result)
+	})
+
+	t.Run("raw IPv6 addresses are passed through", func(t *testing.T) {
+		hosts := []string{testLoopbackIPv6}
+		result, err := resolveHostsToIPs(hosts)
+		require.NoError(t, err)
+		require.Equal(t, []string{testLoopbackIPv6}, result)
+	})
+
+	t.Run("localhost resolves to IP", func(t *testing.T) {
+		hosts := []string{testLocalHostname}
+		result, err := resolveHostsToIPs(hosts)
+		require.NoError(t, err)
+		require.Len(t, result, 1)
+		// localhost should resolve to 127.0.0.1 or ::1
+		require.True(t, result[0] == testLoopbackIP || result[0] == testLoopbackIPv6,
+			"expected localhost to resolve to 127.0.0.1 or ::1, got %s", result[0])
+	})
+
+	t.Run("mixed IPs and hostnames both work", func(t *testing.T) {
+		hosts := []string{testPrefillHostIP1, testLocalHostname}
+		result, err := resolveHostsToIPs(hosts)
+		require.NoError(t, err)
+		require.Len(t, result, 2)
+		require.Equal(t, testPrefillHostIP1, result[0])
+		// localhost resolves to 127.0.0.1 or ::1
+		require.True(t, result[1] == testLoopbackIP || result[1] == testLoopbackIPv6)
+	})
+
+	t.Run("multiple DNS names resolve correctly", func(t *testing.T) {
+		hosts := []string{testLocalHostname, testLocalHostname}
+		result, err := resolveHostsToIPs(hosts)
+		require.NoError(t, err)
+		require.Len(t, result, 2)
+		for _, h := range result {
+			require.True(t, h == testLoopbackIP || h == testLoopbackIPv6,
+				"expected resolved IP, got %s", h)
+		}
+	})
+
+	t.Run("unresolvable hostname errors", func(t *testing.T) {
+		hosts := []string{"this-hostname-does-not-exist-12345.invalid"}
+		_, err := resolveHostsToIPs(hosts)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "failed to resolve")
+	})
+}
+
+// TestCompleteAutomaticDNSResolution tests that DNS hostnames in
+// --moriio-remote-hosts and --moriio-decode-hosts are automatically resolved
+// to IPs at startup, aligning with LWS (LeaderWorkerSet) patterns.
+func TestCompleteAutomaticDNSResolution(t *testing.T) {
+	if !MoRIIOFeatureEnabled {
+		t.Skip("MoRI-IO feature is dormant; skipping DNS resolution tests")
+	}
+
+	t.Run("raw IP addresses are passed through", func(t *testing.T) {
+		opts := NewOptions()
+		opts.MoRIIOWriteMode = true
+		opts.MoRIIODecodePodIP = testDecodeHostIP
+		opts.MoRIIODPSize = 16
+		opts.MoRIIODPSizeLocal = 8
+		opts.MoRIIORemoteHosts = []string{testPrefillHostIP1, testPrefillHostIP2}
+		opts.MoRIIODecodeHosts = []string{testDecodeHostIP, testDecodeHostIP2}
+		require.NoError(t, opts.Complete())
+		// IPs should be passed through unchanged
+		require.Equal(t, []string{testPrefillHostIP1, testPrefillHostIP2}, opts.MoRIIORemoteHosts)
+		require.Equal(t, []string{testDecodeHostIP, testDecodeHostIP2}, opts.MoRIIODecodeHosts)
+	})
+
+	t.Run("localhost automatically resolves to IP", func(t *testing.T) {
+		opts := NewOptions()
+		opts.MoRIIOWriteMode = true
+		opts.MoRIIODecodePodIP = testDecodeHostIP
+		opts.MoRIIODPSize = 8
+		opts.MoRIIODPSizeLocal = 8
+		opts.MoRIIORemoteHosts = []string{testLocalHostname}
+		opts.MoRIIODecodeHosts = []string{testLocalHostname}
+		require.NoError(t, opts.Complete())
+		// localhost should be automatically resolved to an IP
+		require.True(t, opts.MoRIIORemoteHosts[0] == testLoopbackIP || opts.MoRIIORemoteHosts[0] == testLoopbackIPv6)
+		require.True(t, opts.MoRIIODecodeHosts[0] == testLoopbackIP || opts.MoRIIODecodeHosts[0] == testLoopbackIPv6)
+	})
+
+	t.Run("unresolvable hostname errors", func(t *testing.T) {
+		opts := NewOptions()
+		opts.MoRIIOWriteMode = true
+		opts.MoRIIODecodePodIP = testDecodeHostIP
+		opts.MoRIIODPSize = 8
+		opts.MoRIIORemoteHosts = []string{"unresolvable-host-xyz.invalid"}
+		err := opts.Complete()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "resolving --moriio-remote-hosts")
+	})
+
+	t.Run("local-pod-ip raw IP is passed through", func(t *testing.T) {
+		opts := NewOptions()
+		opts.MoRIIOWriteMode = true
+		opts.MoRIIODecodePodIP = testDecodeHostIP
+		opts.MoRIIODPSize = 8
+		opts.MoRIIODPSizeLocal = 8
+		require.NoError(t, opts.Complete())
+		require.Equal(t, testDecodeHostIP, opts.MoRIIODecodePodIP)
+	})
+
+	t.Run("local-pod-ip DNS name resolves to IP", func(t *testing.T) {
+		opts := NewOptions()
+		opts.MoRIIOWriteMode = true
+		opts.MoRIIODecodePodIP = testLocalHostname
+		opts.MoRIIODPSize = 8
+		opts.MoRIIODPSizeLocal = 8
+		require.NoError(t, opts.Complete())
+		require.True(t, opts.MoRIIODecodePodIP == testLoopbackIP || opts.MoRIIODecodePodIP == testLoopbackIPv6)
+	})
+
+	t.Run("local-pod-ip unresolvable hostname errors", func(t *testing.T) {
+		opts := NewOptions()
+		opts.MoRIIOWriteMode = true
+		opts.MoRIIODecodePodIP = "unresolvable-host-xyz.invalid"
+		opts.MoRIIODPSize = 8
+		err := opts.Complete()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "resolving --moriio-local-pod-ip")
+	})
+}
+
+// TestWideEPScenarios tests both 1P1D and 2P2D Wide-EP configurations to ensure
+// automatic DNS resolution works correctly in both single-pod and multi-pod scenarios.
+func TestWideEPScenarios(t *testing.T) {
+	if !MoRIIOFeatureEnabled {
+		t.Skip("MoRI-IO feature is dormant; skipping Wide-EP scenario tests")
+	}
+
+	// Scenario 1: 1P1D (DP=EP=8, TP=1, intra-node single pod)
+	// This is the simplest Wide-EP case: all 8 DP ranks on a single pod pair.
+	t.Run("1P1D DP=8 intra-node (no remote hosts)", func(t *testing.T) {
+		opts := NewOptions()
+		opts.MoRIIOWriteMode = true
+		opts.MoRIIODecodePodIP = testPrefillHostIP1
+		opts.MoRIIODPSize = 8
+		opts.MoRIIOTPSize = 1
+		// No remote hosts needed for single-pod 1P1D
+		opts.MoRIIORemoteHosts = nil
+		opts.MoRIIODecodeHosts = nil
+		opts.MoRIIODPSizeLocal = 0 // Not needed for single pod
+
+		require.NoError(t, opts.Complete())
+		// Verify config is set correctly for 1P1D
+		require.Equal(t, 8, opts.MoRIIODPSize)
+		require.Equal(t, 1, opts.MoRIIOTPSize)
+		require.Empty(t, opts.MoRIIORemoteHosts)
+		require.Empty(t, opts.MoRIIODecodeHosts)
+	})
+
+	// Scenario 2: 2P2D (DP=EP=16, TP=1, inter-node multi-pod)
+	// Two prefill pods + two decode pods, each with 8 DP ranks.
+	// Both raw IPs and DNS names are supported.
+	t.Run("2P2D DP=16 inter-node with IPs (static deployment)", func(t *testing.T) {
+		opts := NewOptions()
+		opts.MoRIIOWriteMode = true
+		opts.MoRIIODecodePodIP = testDecodeHostIP
+		opts.MoRIIODPSize = 16
+		opts.MoRIIOTPSize = 1
+		opts.MoRIIODPSizeLocal = 8
+		// Raw IPs work for static IP deployments
+		opts.MoRIIORemoteHosts = []string{testPrefillHostIP1, testPrefillHostIP2}
+		opts.MoRIIODecodeHosts = []string{testDecodeHostIP, testDecodeHostIP2}
+
+		require.NoError(t, opts.Complete())
+		// IPs should be passed through unchanged
+		require.Equal(t, []string{testPrefillHostIP1, testPrefillHostIP2}, opts.MoRIIORemoteHosts)
+		require.Equal(t, []string{testDecodeHostIP, testDecodeHostIP2}, opts.MoRIIODecodeHosts)
+	})
+
+	t.Run("2P2D DP=16 inter-node with DNS names (LWS pattern)", func(t *testing.T) {
+		opts := NewOptions()
+		opts.MoRIIOWriteMode = true
+		opts.MoRIIODecodePodIP = testDecodeHostIP
+		opts.MoRIIODPSize = 16
+		opts.MoRIIOTPSize = 1
+		opts.MoRIIODPSizeLocal = 8
+		// Use localhost as a resolvable DNS name for testing
+		opts.MoRIIORemoteHosts = []string{testLocalHostname, testLocalHostname}
+		opts.MoRIIODecodeHosts = []string{testLocalHostname, testLocalHostname}
+
+		require.NoError(t, opts.Complete())
+		// DNS names should be resolved to IPs
+		require.Len(t, opts.MoRIIORemoteHosts, 2)
+		require.Len(t, opts.MoRIIODecodeHosts, 2)
+		// All entries should now be IPs (127.0.0.1 or ::1)
+		for _, h := range opts.MoRIIORemoteHosts {
+			require.True(t, h == testLoopbackIP || h == testLoopbackIPv6,
+				"expected resolved IP, got %s", h)
+		}
+		for _, h := range opts.MoRIIODecodeHosts {
+			require.True(t, h == testLoopbackIP || h == testLoopbackIPv6,
+				"expected resolved IP, got %s", h)
+		}
+	})
+
+	// Validation tests for multi-pod configuration invariants
+	t.Run("2P2D validation: dp-size must be divisible by dp-size-local", func(t *testing.T) {
+		opts := NewOptions()
+		opts.MoRIIOWriteMode = true
+		opts.MoRIIODecodePodIP = testDecodeHostIP
+		opts.MoRIIODPSize = 15 // Not divisible by 8
+		opts.MoRIIODPSizeLocal = 8
+		opts.MoRIIORemoteHosts = []string{testPrefillHostIP1, testPrefillHostIP2}
+
+		err := opts.Complete()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "must be divisible")
+	})
+
+	t.Run("2P2D validation: host count must match pod count", func(t *testing.T) {
+		opts := NewOptions()
+		opts.MoRIIOWriteMode = true
+		opts.MoRIIODecodePodIP = testDecodeHostIP
+		opts.MoRIIODPSize = 16
+		opts.MoRIIODPSizeLocal = 8
+		// 3 hosts but dp-size/dp-size-local = 2 pods
+		opts.MoRIIORemoteHosts = []string{testPrefillHostIP1, testPrefillHostIP2, "10.0.0.3"}
+
+		err := opts.Complete()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "count of hosts must match")
+	})
+
+	t.Run("2P2D validation: dp-size-local required for multi-host", func(t *testing.T) {
+		opts := NewOptions()
+		opts.MoRIIOWriteMode = true
+		opts.MoRIIODecodePodIP = testDecodeHostIP
+		opts.MoRIIODPSize = 16
+		opts.MoRIIODPSizeLocal = 0 // Missing!
+		opts.MoRIIORemoteHosts = []string{testPrefillHostIP1, testPrefillHostIP2}
+
+		err := opts.Complete()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "dp-size-local")
+	})
 }

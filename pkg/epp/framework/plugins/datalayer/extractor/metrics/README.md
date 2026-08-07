@@ -41,6 +41,8 @@ The plugin config supports:
     but will be removed in a future release.
 -   `defaultEngine`: The engine type to use if the label is missing. Defaults to `vllm`.
 -   `engineConfigs`: A list of engine-specific metric specifications.
+    Each engine config can also include `customMetrics` entries. Each entry
+    maps a scalar metric selector to an endpoint attribute key.
 
 ### Built-in Engine Configurations
 
@@ -70,6 +72,9 @@ parameters:
       queuedRequestsSpec: "custom_queue_size{status=waiting}"
       runningRequestsSpec: "custom_running_size"
       kvUsageSpec: "custom_cache_utilization"
+      customMetrics:
+        - attributeKey: "custom.queue_depth"
+          metricSpec: "custom_queue_depth{tier=gold}"
 ```
 
 and the model server deployment Pods should have the label:
@@ -83,3 +88,6 @@ metadata:
 
 ```
 
+## Multi-cluster support
+
+`multicluster-metrics-extractor` is the cluster-scoped variant. It reads only a pool's aggregate metrics (`llm_d_epp_average_kv_cache_utilization`, `llm_d_epp_average_queue_size`) into the `llm-d.ai/multicluster-*` attributes the multicluster scorers read, rather than running per-pod engine extraction. Pair it with `multicluster-metrics-data-source`. See the [wiring example](../../../README.md#example).

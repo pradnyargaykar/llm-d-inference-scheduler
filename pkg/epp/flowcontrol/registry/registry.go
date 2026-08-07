@@ -19,24 +19,28 @@ package registry
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/go-logr/logr"
 	"k8s.io/utils/clock"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts"
-	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/framework/plugins/queue"
+	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/queue"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
+	"github.com/llm-d/llm-d-router/pkg/epp/metrics"
 )
 
 // propagateStatsDeltaFunc defines the callback function used to propagate statistics changes (deltas) up the hierarchy
-// (Queue -> Shard -> Registry).
+// (Queue -> Registry).
 // Implementations MUST be non-blocking (relying on atomics).
 type propagateStatsDeltaFunc func(priority int, lenDelta, byteSizeDelta int64)
 
-// bandStats holds the aggregated atomic statistics for a single priority band across all shards.
+// bandStats holds the aggregated atomic statistics for a single priority band.
 type bandStats struct {
 	byteSize atomic.Int64
 	len      atomic.Int64
@@ -47,7 +51,7 @@ type flowState struct {
 	leasedState
 	key flowcontrol.FlowKey
 
-	// initialized ensures that the heavy-weight infrastructure provisioning (creating queues on shards) happens exactly
+	// initialized ensures that the heavy-weight infrastructure provisioning (creating queues) happens exactly
 	// once per flowState instance.
 	// This prevents race conditions where multiple concurrent requests might attempt to provision the same flow
 	// simultaneously.
@@ -65,8 +69,8 @@ type priorityBandState struct {
 
 // FlowRegistry is the concrete implementation of the contracts.FlowRegistry interface.
 //
-// The FlowRegistry manages the mapping between abstract FlowKeys and the concrete managed queues distributed across
-// internal shards. It serves as the single source of truth for flow control configuration and lifecycle management.
+// The FlowRegistry manages the mapping between abstract FlowKeys and their concrete managed queues. It serves as the
+// single source of truth for flow control configuration and lifecycle management.
 //
 // # Concurrency Model
 //
@@ -114,9 +118,25 @@ type FlowRegistry struct {
 	// orderedPriorityLevels is a sorted list of active priority levels.
 	// It is updated dynamically when new bands are provisioned.
 	orderedPriorityLevels []int
+
+	// initialPriorities tracks priority bands provisioned at startup.
+	// These are never removed by control-plane sync or garbage collection.
+	initialPriorities map[int]struct{}
+
+	// desiredPriorities tracks the most recent set of priority bands the control plane wants provisioned
+	// (the last value applied via ApplyDesiredPriorities). Bands in this set are protected from garbage
+	// collection: a desired band that is merely idle (no live flows) must not be reaped.
+	desiredPriorities map[int]struct{}
+
+	// priorityBandUpdateCh carries desired priority topology updates from the control plane to the processor loop.
+	priorityBandUpdateCh chan map[int]struct{}
 }
 
-var _ contracts.FlowRegistry = &FlowRegistry{}
+var (
+	_ contracts.FlowRegistry             = &FlowRegistry{}
+	_ contracts.PriorityBandControlPlane = &FlowRegistry{}
+	_ contracts.FlowRegistryBackground   = &FlowRegistry{}
+)
 
 // RegistryOption allows configuring the `FlowRegistry` during initialization.
 type RegistryOption func(*FlowRegistry)
@@ -135,8 +155,11 @@ func withClock(clk clock.WithTickerAndDelayedExecution) RegistryOption {
 func NewFlowRegistry(config *Config, logger logr.Logger, opts ...RegistryOption) *FlowRegistry {
 	cfg := config.Clone()
 	fr := &FlowRegistry{
-		config: cfg,
-		logger: logger.WithName("flow-registry"),
+		config:               cfg,
+		logger:               logger.WithName("flow-registry"),
+		initialPriorities:    make(map[int]struct{}),
+		desiredPriorities:    make(map[int]struct{}),
+		priorityBandUpdateCh: make(chan map[int]struct{}, 1),
 	}
 
 	for _, opt := range opts {
@@ -147,6 +170,7 @@ func NewFlowRegistry(config *Config, logger logr.Logger, opts ...RegistryOption)
 	}
 
 	for prio, bandConfig := range cfg.PriorityBands {
+		fr.initialPriorities[prio] = struct{}{}
 		fr.perPriorityBandStats.LoadOrStore(prio, &bandStats{})
 		fr.initPriorityBand(bandConfig)
 	}
@@ -156,22 +180,103 @@ func NewFlowRegistry(config *Config, logger logr.Logger, opts ...RegistryOption)
 	return fr
 }
 
-// Run starts the registry's background garbage collection loop.
-// It blocks until the provided context is cancelled.
-func (fr *FlowRegistry) Run(ctx context.Context) {
-	fr.logger.Info("Starting FlowRegistry background garbage collection loop")
-	defer fr.logger.Info("FlowRegistry background garbage collection loop stopped")
+// RunMaintenanceLoop applies priority band updates and runs registry GC until ctx is cancelled.
+// Production uses the Processor loop; this helper supports tests that run without a FlowController.
+func (fr *FlowRegistry) RunMaintenanceLoop(ctx context.Context) {
 	gcTicker := fr.clock.NewTicker(fr.config.FlowGCTimeout)
 	defer gcTicker.Stop()
-
+	updateCh := fr.PriorityBandUpdateChannel()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case desired := <-updateCh:
+			fr.ApplyDesiredPriorities(desired)
 		case <-gcTicker.C():
-			fr.executeGCCycle()
+			fr.ExecuteGCCycle()
 		}
 	}
+}
+
+// SubmitDesiredPriorities queues a priority band topology update for the processor loop.
+// Stale pending updates are dropped so only the latest desired state is retained.
+func (fr *FlowRegistry) SubmitDesiredPriorities(desired map[int]struct{}) {
+	if desired == nil {
+		desired = map[int]struct{}{}
+	}
+	desiredCopy := make(map[int]struct{}, len(desired))
+	for priority := range desired {
+		desiredCopy[priority] = struct{}{}
+	}
+
+	// Drain any stale pending update so only the latest state is queued.
+	select {
+	case <-fr.priorityBandUpdateCh:
+	default:
+	}
+
+	// After draining, the channel always has capacity; this send never blocks.
+	fr.priorityBandUpdateCh <- desiredCopy
+}
+
+// PriorityBandUpdateChannel returns the channel carrying desired priority topology updates.
+func (fr *FlowRegistry) PriorityBandUpdateChannel() <-chan map[int]struct{} {
+	return fr.priorityBandUpdateCh
+}
+
+// FlowGCTimeout returns the interval between registry garbage collection cycles.
+func (fr *FlowRegistry) FlowGCTimeout() time.Duration {
+	return fr.config.FlowGCTimeout
+}
+
+// ApplyDesiredPriorities provisions missing priority bands and removes idle bands no longer desired.
+// It is invoked by the Processor maintenance loop.
+func (fr *FlowRegistry) ApplyDesiredPriorities(desired map[int]struct{}) {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+
+	// Record the desired set so GC (and any other deletion path) does not reap a band the control plane
+	// still wants. Store a defensive copy: SubmitDesiredPriorities crosses goroutine boundaries and direct
+	// callers may retain or mutate their map after the call.
+	desiredCopy := make(map[int]struct{}, len(desired))
+	for priority := range desired {
+		desiredCopy[priority] = struct{}{}
+	}
+	fr.desiredPriorities = desiredCopy
+
+	for priority := range desiredCopy {
+		if _, ok := fr.config.PriorityBands[priority]; !ok {
+			fr.provisionPriorityBandLocked(priority)
+		}
+	}
+
+	// Remove bands that are no longer protected (neither static nor desired) once they are idle.
+	for priority := range fr.config.PriorityBands {
+		if fr.isBandProtectedLocked(priority) {
+			continue
+		}
+		if !fr.isPriorityBandIdle(priority) {
+			continue
+		}
+		// Cheap best-effort guard against tearing down a band that just became active. Holding fr.mu does
+		// not actually exclude a concurrent pin: pinLeasedResource is lock-free and never takes fr.mu. The
+		// removal is safe regardless, since pinLeasedResource's stale-object protection backs off a racing
+		// pin and the priority-0 fallback plus the next reconcile/GC cycle self-heal.
+		if val, ok := fr.priorityBandStates.Load(priority); ok {
+			if val.(*priorityBandState).isActive() {
+				continue
+			}
+		}
+		fr.priorityBandStates.Delete(priority)
+		fr.cleanupPriorityBandResourcesLocked(priority)
+	}
+}
+
+// ExecuteGCCycle runs a single registry garbage collection cycle.
+func (fr *FlowRegistry) ExecuteGCCycle() {
+	fr.logger.V(logging.DEBUG).Info("Starting periodic GC scan")
+	fr.gcFlows()
+	fr.gcPriorityBands()
 }
 
 // --- `contracts.FlowRegistryDataPlane` Implementation ---
@@ -182,7 +287,7 @@ func (fr *FlowRegistry) Run(ctx context.Context) {
 // This method relies on an atomic leasing mechanism, ensuring that active flows are never garbage collected while
 // requests are in flight.
 //
-// If the flow does not exist, it is provisioned Just-In-Time (JIT).
+// If the flow does not exist, it is provisioned on first use. The priority band must already exist.
 //
 // When a NEW flow is created, this method also increments the corresponding priority band's lease count,
 // establishing the invariant: bandState.leaseCount = number of active flows at this priority.
@@ -210,9 +315,8 @@ func (fr *FlowRegistry) WithConnection(key flowcontrol.FlowKey, fn func(conn con
 	}
 	defer state.unpin(fr.clock.Now())
 
-	// 2. JIT provisioning: Ensure physical resources exist on shards.
-	// We use sync.Once to ensure we only pay the initialization cost (building components, locking shards) exactly once
-	// per flowState object.
+	// 2. Flow provisioning: Ensure physical resources exist.
+	// We use sync.Once to ensure we only pay the initialization cost exactly once per flowState object.
 	state.initialized.Do(func() {
 		state.initErr = fr.ensureFlowInfrastructure(key)
 	})
@@ -223,14 +327,13 @@ func (fr *FlowRegistry) WithConnection(key flowcontrol.FlowKey, fn func(conn con
 		fr.flowStates.Delete(key)
 
 		// Release the band lease if we created the flow.
-		// If JIT provisioning fails for a new flow, we must release that lease to prevent leaking band leases.
 		if isNewFlow {
 			if bandVal, ok := fr.priorityBandStates.Load(key.Priority); ok {
 				bandVal.(*priorityBandState).unpin(fr.clock.Now())
 			}
 		}
 
-		return fmt.Errorf("failed to provision JIT flow resources: %w", state.initErr)
+		return state.initErr
 	}
 
 	// 3. Execute callback.
@@ -238,54 +341,33 @@ func (fr *FlowRegistry) WithConnection(key flowcontrol.FlowKey, fn func(conn con
 	return fn(&connection{registry: fr, key: key})
 }
 
-// ensureFlowInfrastructure guarantees that the Priority Band exists and that the flow's queues are synchronized across
-// all active shards.
+// ensureFlowInfrastructure guarantees that the Priority Band exists and that the flow's queue is synchronized.
 //
 // NOTE: The caller (WithConnection) must already hold a lease on the priority band to prevent GC during this operation.
 func (fr *FlowRegistry) ensureFlowInfrastructure(key flowcontrol.FlowKey) error {
-	// 1. Ensure Priority Band exists.
+	// buildFlowComponents validates that the priority band exists (returning ErrPriorityBandNotFound if not)
+	// under the same read lock it uses to read the topology, so a single acquisition covers both.
 	fr.mu.RLock()
-	_, exists := fr.config.PriorityBands[key.Priority]
-	fr.mu.RUnlock()
-
-	if !exists {
-		if err := fr.ensurePriorityBand(key.Priority); err != nil {
-			return err
-		}
-	}
-
-	// Now we know the band exists (or we errored). Re-acquire Read Lock to safely read the topology and build components.
-
-	// 2. Synchronize shards.
-	// Acquire Read Lock to iterate the shard topology safely.
-	fr.mu.RLock()
-
-	components, err := fr.buildFlowComponents(key)
-
-	// Free the lock here as synchronizeFlow acquires the mutex for writes
+	policy, q, err := fr.buildFlowComponents(key)
 	fr.mu.RUnlock()
 
 	if err != nil {
 		return err
 	}
 
-	fr.synchronizeFlow(key, components.policy, components.queue)
+	fr.synchronizeFlow(key, policy, q)
 
-	fr.logger.V(logging.DEBUG).Info("JIT provisioned flow infrastructure", "flowKey", key)
+	fr.logger.V(logging.DEBUG).Info("Provisioned flow infrastructure", "flowKey", key)
 	return nil
 }
 
-// ensurePriorityBand safely provisions a new priority band.
-func (fr *FlowRegistry) ensurePriorityBand(priority int) error {
-	fr.mu.Lock()
-	defer fr.mu.Unlock()
-
-	// Double-Check: Someone might have created it while we swapped locks in prepareNewFlow.
+// provisionPriorityBandLocked provisions a new priority band. The caller must hold fr.mu.
+func (fr *FlowRegistry) provisionPriorityBandLocked(priority int) {
 	if _, ok := fr.config.PriorityBands[priority]; ok {
-		return nil
+		return
 	}
 
-	fr.logger.V(logging.DEFAULT).Info("Dynamically provisioning new priority band", "priority", priority)
+	fr.logger.V(logging.DEFAULT).Info("Provisioning priority band from control plane", "priority", priority)
 
 	template := fr.config.DefaultPriorityBand
 	if priority < 0 && fr.config.DefaultNegativePriorityBand != nil {
@@ -302,14 +384,35 @@ func (fr *FlowRegistry) ensurePriorityBand(priority int) error {
 	})
 
 	fr.addPriorityBand(priority)
+}
 
+// ensurePriorityBand provisions a new priority band for tests and legacy callers.
+func (fr *FlowRegistry) ensurePriorityBand(priority int) error {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+
+	fr.provisionPriorityBandLocked(priority)
 	return nil
 }
 
-// deletePriorityBand removes a priority band from the registry and all shards.
-func (fr *FlowRegistry) deletePriorityBand(priority int) {
-	fr.priorityBandStates.Delete(priority)           // Logical delete
-	fr.cleanupPriorityBandResources([]int{priority}) // Physical cleanup
+func (fr *FlowRegistry) isPriorityBandIdle(priority int) bool {
+	val, ok := fr.priorityBandStates.Load(priority)
+	if !ok {
+		return true
+	}
+	return !val.(*priorityBandState).isActive()
+}
+
+// isBandProtectedLocked reports whether a priority band must never be garbage collected.
+// A band is protected if it was provisioned at startup (initialPriorities) or is currently
+// desired by the control plane (desiredPriorities). Protected bands persist even while idle.
+// The caller must hold fr.mu.
+func (fr *FlowRegistry) isBandProtectedLocked(priority int) bool {
+	if _, static := fr.initialPriorities[priority]; static {
+		return true
+	}
+	_, desired := fr.desiredPriorities[priority]
+	return desired
 }
 
 // --- `contracts.FlowRegistryObserver` Implementation ---
@@ -350,13 +453,6 @@ func (fr *FlowRegistry) Stats() contracts.AggregateStats {
 
 // --- Garbage Collection ---
 
-// executeGCCycle orchestrates the periodic GC of Idle flows, idle priority bands, and Drained shards.
-func (fr *FlowRegistry) executeGCCycle() {
-	fr.logger.V(logging.DEBUG).Info("Starting periodic GC scan")
-	fr.gcFlows()
-	fr.gcPriorityBands()
-}
-
 // gcFlows removes idle flows.
 func (fr *FlowRegistry) gcFlows() {
 	deletedFlows := collectLeasedResources[flowcontrol.FlowKey, *flowState](
@@ -378,10 +474,18 @@ func (fr *FlowRegistry) gcFlows() {
 		}
 
 		fr.cleanupFlowResources(keysToClean)
+
+		// Prune the flows' metric series. Fairness IDs come from client input, so without pruning the
+		// per-flow metric vectors grow monotonically with every fairness ID ever observed. Done after
+		// cleanupFlowResources and outside fr.mu: DeletePartialMatch scans whole metric vectors, which
+		// must not run under the registry write lock.
+		for _, key := range keysToClean {
+			metrics.DeleteFlowControlFlowSeries(key.ID, strconv.Itoa(key.Priority))
+		}
 	}
 }
 
-// cleanupFlowResources removes queue resources from the shards for the specified flows.
+// cleanupFlowResources removes queue resources for the specified flows.
 func (fr *FlowRegistry) cleanupFlowResources(keys []flowcontrol.FlowKey) {
 	fr.mu.Lock() // Exclusive lock to prevent race with ensureFlowInfrastructure.
 	defer fr.mu.Unlock()
@@ -413,65 +517,51 @@ func (fr *FlowRegistry) gcPriorityBands() {
 	}
 }
 
-// cleanupPriorityBandResources removes priority band configuration and resources from the registry and all shards.
+// cleanupPriorityBandResources removes priority band configuration and resources from the registry.
 func (fr *FlowRegistry) cleanupPriorityBandResources(priorities []int) {
 	fr.mu.Lock()
 	defer fr.mu.Unlock()
-
 	for _, priority := range priorities {
-		// Zombie protection: verify band was actually deleted from map
-		if _, exists := fr.priorityBandStates.Load(priority); exists {
-			continue
-		}
-
-		// Delete from registry config
-		delete(fr.config.PriorityBands, priority)
-
-		// Delete from stats tracking
-		fr.perPriorityBandStats.Delete(priority)
-
-		// Remove from sync.Map
-		fr.priorityBands.Delete(priority)
-
-		// Remove from ordered list
-		for i, p := range fr.orderedPriorityLevels {
-			if p == priority {
-				fr.orderedPriorityLevels = append(
-					fr.orderedPriorityLevels[:i],
-					fr.orderedPriorityLevels[i+1:]...,
-				)
-				break
-			}
-		}
-
-		fr.logger.V(logging.DEFAULT).Info("Successfully deleted priority band", "priority", priority)
+		fr.cleanupPriorityBandResourcesLocked(priority)
 	}
+}
+
+// cleanupPriorityBandResourcesLocked performs the physical cleanup of a priority band.
+// The caller must hold fr.mu exclusively.
+func (fr *FlowRegistry) cleanupPriorityBandResourcesLocked(priority int) {
+	// Zombie protection: verify band was actually deleted from the state map.
+	if _, exists := fr.priorityBandStates.Load(priority); exists {
+		return
+	}
+
+	// Protected bands (provisioned at startup or still desired by the control plane) are never collected.
+	// The transient band state is already gone, leaving the band in its provisioned state; a later request
+	// re-pins it. This is the single chokepoint that shields protected bands from every deletion path.
+	if fr.isBandProtectedLocked(priority) {
+		return
+	}
+
+	delete(fr.config.PriorityBands, priority)
+	fr.perPriorityBandStats.Delete(priority)
+	fr.priorityBands.Delete(priority)
+
+	fr.orderedPriorityLevels = slices.DeleteFunc(fr.orderedPriorityLevels, func(p int) bool { return p == priority })
+
+	fr.logger.V(logging.DEFAULT).Info("Successfully deleted priority band", "priority", priority)
 }
 
 // --- Internal Helpers ---
 
-// flowComponents holds the plugin instances created for a single flow on a single shard.
-type flowComponents struct {
-	policy flowcontrol.OrderingPolicy
-	queue  contracts.SafeQueue
-}
-
-// buildFlowComponents instantiates the necessary plugin components for a new flow instance.
-// It creates a distinct instance of each component to ensure state isolation.
-func (fr *FlowRegistry) buildFlowComponents(key flowcontrol.FlowKey) (*flowComponents, error) {
+// buildFlowComponents instantiates the plugin components (ordering policy and queue) for a new flow instance.
+// It creates a distinct queue instance to ensure state isolation.
+func (fr *FlowRegistry) buildFlowComponents(
+	key flowcontrol.FlowKey,
+) (flowcontrol.OrderingPolicy, contracts.SafeQueue, error) {
 	bandConfig, ok := fr.config.PriorityBands[key.Priority]
 	if !ok {
-		return nil, fmt.Errorf("priority band %d not found: %w", key.Priority, contracts.ErrPriorityBandNotFound)
+		return nil, nil, fmt.Errorf("priority band %d not found: %w", key.Priority, contracts.ErrPriorityBandNotFound)
 	}
-
-	q, err := queue.NewQueueFromName(bandConfig.Queue, bandConfig.OrderingPolicy)
-	if err != nil {
-		return nil, fmt.Errorf("failed to instantiate queue %q for flow %s: %w",
-			bandConfig.Queue, key, err)
-	}
-	components := &flowComponents{policy: bandConfig.OrderingPolicy, queue: q}
-
-	return components, nil
+	return bandConfig.OrderingPolicy, queue.New(bandConfig.OrderingPolicy), nil
 }
 
 // propagateStatsDelta is the top-level, lock-free aggregator for all statistics.

@@ -19,6 +19,7 @@ package file
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -57,7 +58,7 @@ func (r *recordingNotifier) upsertedNames() []string {
 	defer r.mu.Unlock()
 	names := make([]string, len(r.upserted))
 	for i, m := range r.upserted {
-		names[i] = m.NamespacedName.String()
+		names[i] = m.ID.String()
 	}
 	return names
 }
@@ -74,10 +75,11 @@ func writeTemp(t *testing.T, content string) string {
 
 func newFD(path string, watch bool) *FileDiscovery {
 	return &FileDiscovery{
-		path:      path,
-		watchFile: watch,
-		endpoints: make(map[types.NamespacedName]struct{}),
-		ready:     make(chan struct{}),
+		path:            path,
+		watchFile:       watch,
+		validateAddress: validateIPv4Address,
+		endpoints:       make(map[types.NamespacedName]struct{}),
+		ready:           make(chan struct{}),
 	}
 }
 
@@ -163,7 +165,7 @@ endpoints:
 	cancel()
 
 	require.NoError(t, newFD(path, false).Start(ctx, notifier))
-	assert.Equal(t, "default", notifier.upserted[0].NamespacedName.Namespace)
+	assert.Equal(t, "default", notifier.upserted[0].ID.Namespace)
 }
 
 func TestStart_MetricsHostIsAddressPort(t *testing.T) {
@@ -282,7 +284,7 @@ endpoints:
 		notifier.mu.Lock()
 		defer notifier.mu.Unlock()
 		for _, m := range notifier.upserted {
-			if m.NamespacedName.Name == "ep3" {
+			if m.ID.Name == "ep3" {
 				return true
 			}
 		}
@@ -291,4 +293,83 @@ endpoints:
 
 	cancel()
 	assert.NoError(t, <-done)
+}
+
+func TestDumpState(t *testing.T) {
+	f := &FileDiscovery{
+		endpoints: map[types.NamespacedName]struct{}{
+			{Namespace: "default", Name: "pod-b"}: {},
+			{Namespace: "default", Name: "pod-a"}: {},
+		},
+	}
+
+	payload, err := f.DumpState()
+	require.NoError(t, err)
+
+	var state discoveryState
+	require.NoError(t, json.Unmarshal(payload, &state))
+	assert.Equal(t, []string{"default/pod-a", "default/pod-b"}, state.Endpoints)
+	assert.Equal(t, 2, state.TotalEndpoints)
+	assert.Equal(t, maxDebugDumpEndpoints, state.MaxEndpoints)
+	// The full set fits, so the dump is complete (TotalEndpoints does not exceed MaxEndpoints).
+	assert.LessOrEqual(t, state.TotalEndpoints, state.MaxEndpoints)
+}
+
+func TestDumpStateCaps(t *testing.T) {
+	eps := make(map[types.NamespacedName]struct{}, maxDebugDumpEndpoints+5)
+	for i := 0; i < maxDebugDumpEndpoints+5; i++ {
+		eps[types.NamespacedName{Namespace: "default", Name: fmt.Sprintf("pod-%03d", i)}] = struct{}{}
+	}
+	f := &FileDiscovery{endpoints: eps}
+
+	payload, err := f.DumpState()
+	require.NoError(t, err)
+
+	var state discoveryState
+	require.NoError(t, json.Unmarshal(payload, &state))
+	// The dump is partial: TotalEndpoints exceeds the returned count, capped at MaxEndpoints.
+	assert.Equal(t, maxDebugDumpEndpoints+5, state.TotalEndpoints)
+	assert.Greater(t, state.TotalEndpoints, state.MaxEndpoints)
+	assert.Len(t, state.Endpoints, maxDebugDumpEndpoints)
+	// Sorted ascending, then capped, so the first maxDebugDumpEndpoints names are kept.
+	assert.Equal(t, "default/pod-000", state.Endpoints[0])
+	assert.Equal(t, fmt.Sprintf("default/pod-%03d", maxDebugDumpEndpoints-1), state.Endpoints[maxDebugDumpEndpoints-1])
+}
+
+func TestDumpStateConcurrentWithLoad(t *testing.T) {
+	path := writeTemp(t, "endpoints:\n- name: ep1\n  address: 10.0.0.1\n  port: \"8000\"\n")
+	f := &FileDiscovery{path: path, validateAddress: validateIPv4Address, endpoints: map[types.NamespacedName]struct{}{}}
+	notifier := &recordingNotifier{}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			_ = f.load(notifier)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			if _, err := f.DumpState(); err != nil {
+				t.Errorf("DumpState returned error: %v", err)
+			}
+		}
+	}()
+	wg.Wait()
+}
+
+func TestDumpStateEmpty(t *testing.T) {
+	f := &FileDiscovery{endpoints: map[types.NamespacedName]struct{}{}}
+
+	payload, err := f.DumpState()
+	require.NoError(t, err)
+	assert.True(t, json.Valid(payload))
+
+	var state discoveryState
+	require.NoError(t, json.Unmarshal(payload, &state))
+	assert.Empty(t, state.Endpoints)
+	assert.Equal(t, 0, state.TotalEndpoints)
+	assert.Equal(t, maxDebugDumpEndpoints, state.MaxEndpoints)
 }

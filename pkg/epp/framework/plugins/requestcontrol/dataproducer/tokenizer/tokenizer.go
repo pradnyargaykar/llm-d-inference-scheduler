@@ -25,10 +25,12 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
-	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
-	"github.com/llm-d/llm-d-kv-cache/pkg/tokenization"
-	tokenizerTypes "github.com/llm-d/llm-d-kv-cache/pkg/tokenization/types"
+	kvctok "github.com/llm-d/llm-d-kv-cache/pkg/tokenization"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/tokenization"
+	tokenizerTypes "github.com/llm-d/llm-d-router/pkg/kvcache/tokenization/types"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
@@ -38,8 +40,8 @@ import (
 )
 
 type tokenizer interface {
-	Render(ctx context.Context, prompt string) ([]uint32, []tokenizerTypes.Offset, error)
-	RenderChat(ctx context.Context, req *tokenizerTypes.RenderChatRequest) ([]uint32, *tokenization.MultiModalFeatures, error)
+	Render(ctx context.Context, payload fwkrh.RequestPayload) ([][]uint32, [][]tokenizerTypes.Offset, error)
+	RenderChat(ctx context.Context, payload fwkrh.RequestPayload) ([]uint32, *tokenization.MultiModalFeatures, error)
 }
 
 const (
@@ -68,7 +70,7 @@ type tokenizerPluginConfig struct {
 	//
 	// Deprecated: the UDS tokenizer backend is deprecated and will be removed
 	// in a future release. Migrate to the `vllm` HTTP /render backend.
-	TokenizerConfig tokenization.UdsTokenizerConfig `json:"udsTokenizerConfig,omitempty"`
+	TokenizerConfig kvctok.UdsTokenizerConfig `json:"udsTokenizerConfig,omitempty"`
 	// VLLM configures the vLLM /render backend.
 	VLLM *vllmConfig `json:"vllm,omitempty"`
 	// Estimate selects the tokenizer-free byte-packing backend; mutually
@@ -78,11 +80,13 @@ type tokenizerPluginConfig struct {
 	ModelName string `json:"modelName"`
 }
 
-// estimateConfig configures the estimation backend. Multimodal image estimation
-// is the only tunable; an empty config uses built-in defaults.
+// estimateConfig configures the estimation backend. Multimodal image and video
+// estimation are the only tunables; an empty config uses built-in defaults.
 type estimateConfig struct {
 	// Image tunes multimodal image placeholder-token estimation.
 	Image *imageEstimateConfig `json:"image,omitempty"`
+	// Video tunes multimodal video placeholder-token estimation.
+	Video *videoEstimateConfig `json:"video,omitempty"`
 }
 
 // imageEstimateConfig tunes how an image's placeholder-token count is estimated.
@@ -111,10 +115,87 @@ type dynamicImageConfig struct {
 	Factor int `json:"factor,omitempty"`
 }
 
-// resolution is an image width/height in pixels.
+// resolution is an image or video-frame width/height in pixels.
 type resolution struct {
 	Width  int `json:"width"`
 	Height int `json:"height"`
+}
+
+// videoEstimateConfig tunes how a video's placeholder-token count is estimated:
+// min(frames * tokensPerFrame, maxVideoTokens). Empty fields fall back to
+// built-in defaults. qwen3 is dynamic tokens-per-frame + sampled frames; gemma4
+// is static tokens-per-frame + strided frames. Duration and resolution are not
+// decoded from the video; they come from these fields.
+type videoEstimateConfig struct {
+	// DefaultResolution is the per-frame resolution used for dynamic
+	// tokens-per-frame.
+	DefaultResolution *resolution `json:"defaultResolution,omitempty"`
+	// DefaultDuration is the video length in seconds used for frame counting.
+	DefaultDuration float64 `json:"defaultDuration,omitempty"`
+	// TokensPerFrame configures the per-frame placeholder count.
+	TokensPerFrame *tokensPerFrameConfig `json:"tokensPerFrame,omitempty"`
+	// Frames configures how many frames are sampled from the video.
+	Frames *framesConfig `json:"frames,omitempty"`
+	// MaxVideoTokens caps the total placeholder count. Zero means uncapped.
+	MaxVideoTokens int `json:"maxVideoTokens,omitempty"`
+}
+
+// tokensPerFrameConfig configures the per-frame placeholder count.
+type tokensPerFrameConfig struct {
+	// Mode selects "dynamic" (width*height/factor) or "static" (a constant count).
+	Mode string `json:"mode,omitempty"`
+	// Static configures the static (constant per-frame) mode.
+	Static *tokensPerFrameStaticMode `json:"static,omitempty"`
+	// Dynamic configures the dynamic (pixels/factor) mode.
+	Dynamic *tokensPerFrameDynamicMode `json:"dynamic,omitempty"`
+}
+
+// tokensPerFrameStaticMode is the static-mode parameter.
+type tokensPerFrameStaticMode struct {
+	// NumTokensPerFrame is the per-frame placeholder count.
+	NumTokensPerFrame int `json:"numTokensPerFrame,omitempty"`
+}
+
+// tokensPerFrameDynamicMode is the dynamic-mode parameter.
+type tokensPerFrameDynamicMode struct {
+	// Factor maps a frame's pixels to placeholder tokens (width*height/factor).
+	Factor int `json:"factor,omitempty"`
+}
+
+// framesConfig configures how many frames are counted from a video. MinFrames
+// and MaxFrames clamp the count in both modes; the mode sub-structs hold the
+// mode-specific knobs.
+type framesConfig struct {
+	// Mode selects "sampled" (duration*sampleFPS) or "strided"
+	// (duration*sourceFPS/frameStride).
+	Mode string `json:"mode,omitempty"`
+	// MinFrames floors the frame count. Zero means no floor.
+	MinFrames int `json:"minFrames,omitempty"`
+	// MaxFrames caps the frame count. Zero means uncapped.
+	MaxFrames int `json:"maxFrames,omitempty"`
+	// Sampled configures the sampled (duration*sampleFPS) mode.
+	Sampled *framesSampledMode `json:"sampled,omitempty"`
+	// Strided configures the strided (duration*sourceFPS/frameStride) mode.
+	Strided *framesStridedMode `json:"strided,omitempty"`
+}
+
+// framesSampledMode configures the sampled frame-count mode.
+type framesSampledMode struct {
+	// SampleFPS is the sampling rate.
+	SampleFPS float64 `json:"sampleFPS,omitempty"`
+	// TemporalPatchSize merges every N sampled frames into one token group,
+	// modeling temporal patch merging (e.g. qwen3-vl uses 2). Values < 2 apply
+	// no merging.
+	TemporalPatchSize int `json:"temporalPatchSize,omitempty"`
+}
+
+// framesStridedMode configures the strided frame-count mode.
+type framesStridedMode struct {
+	// DefaultSourceFPS is the fallback source frame rate, used when the
+	// x-llm-d-video-fps header is absent.
+	DefaultSourceFPS float64 `json:"defaultSourceFPS,omitempty"`
+	// FrameStride keeps every Nth source frame.
+	FrameStride int `json:"frameStride,omitempty"`
 }
 
 // PluginFactory is the factory function for the tokenizer plugin.
@@ -141,6 +222,19 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 	if config.Estimate != nil && config.Estimate.Image != nil {
 		if m := config.Estimate.Image.Mode; m != "" && m != imageModeDynamic && m != imageModeStatic {
 			return nil, fmt.Errorf("invalid configuration for '%s' plugin: estimate.image.mode must be %q or %q", PluginType, imageModeDynamic, imageModeStatic)
+		}
+	}
+	if config.Estimate != nil && config.Estimate.Video != nil {
+		vid := config.Estimate.Video
+		if vid.TokensPerFrame != nil {
+			if m := vid.TokensPerFrame.Mode; m != "" && m != videoTPFModeDynamic && m != videoTPFModeStatic {
+				return nil, fmt.Errorf("invalid configuration for '%s' plugin: estimate.video.tokensPerFrame.mode must be %q or %q", PluginType, videoTPFModeDynamic, videoTPFModeStatic)
+			}
+		}
+		if vid.Frames != nil {
+			if m := vid.Frames.Mode; m != "" && m != videoFramesModeSampled && m != videoFramesModeStrided {
+				return nil, fmt.Errorf("invalid configuration for '%s' plugin: estimate.video.frames.mode must be %q or %q", PluginType, videoFramesModeSampled, videoFramesModeStrided)
+			}
 		}
 	}
 
@@ -192,14 +286,18 @@ func NewPlugin(ctx context.Context, name string, config *tokenizerPluginConfig) 
 		}
 		backend = renderBackend{tk: renderer}
 	default:
-		backend = estimateBackend{img: newImageEstimator(config.Estimate)}
+		backend = estimateBackend{img: newImageEstimator(config.Estimate), vid: newVideoEstimator(config.Estimate)}
 	}
 
-	return &Plugin{
+	p := &Plugin{
 		typedName: plugin.TypedName{Type: PluginType, Name: name},
 		backend:   backend,
 		dk:        TokenizedPromptDataKey.WithNonEmptyProducerName(name),
-	}, nil
+	}
+	if w, ok := backend.(warmer); ok {
+		go w.warmup(ctx)
+	}
+	return p, nil
 }
 
 // Plugin tokenizes the prompt in the incoming request and writes the result to
@@ -210,8 +308,11 @@ type Plugin struct {
 	dk        plugin.DataKey
 }
 
-// compile-time assertion.
-var _ requestcontrol.DataProducer = &Plugin{}
+// compile-time assertions.
+var (
+	_ requestcontrol.DataProducer         = &Plugin{}
+	_ requestcontrol.TimeoutAwareProducer = &Plugin{}
+)
 
 // TypedName returns the typed name of the plugin.
 func (p *Plugin) TypedName() plugin.TypedName {
@@ -221,6 +322,16 @@ func (p *Plugin) TypedName() plugin.TypedName {
 // Produces returns the data keys this plugin produces.
 func (p *Plugin) Produces() map[plugin.DataKey]any {
 	return map[plugin.DataKey]any{p.dk: fwkrh.TokenizedPrompt{}}
+}
+
+// ProduceTimeout surfaces the backend's render timeout when it manages one, so
+// the director extends the data-producer budget past its default. Returns 0 to
+// keep the default (e.g. the estimate backend, which is in-memory).
+func (p *Plugin) ProduceTimeout() time.Duration {
+	if ta, ok := p.backend.(timeoutAware); ok {
+		return ta.produceTimeout()
+	}
+	return 0
 }
 
 // Produce derives the request's TokenizedPrompt via the configured backend and
@@ -234,17 +345,20 @@ func (p *Plugin) Produce(ctx context.Context, request *scheduling.InferenceReque
 		// A parser (e.g. vLLM gRPC) may pre-populate tokens without a salt;
 		// ensure cache-salt isolation still applies on the skip path.
 		if request.Body.TokenizedPrompt.CacheSalt == "" {
-			request.Body.TokenizedPrompt.CacheSalt = cacheSaltFromBody(request.Body)
+			request.Body.TokenizedPrompt.CacheSalt = CacheSaltFromBody(request.Body)
 		}
 		return nil
 	}
 
+	ctx = withMMMetadata(ctx, parseMMMetadataHeaders(request.Headers))
 	tp, err := p.backend.produce(ctx, request.Body)
 	if err != nil {
 		return err
 	}
-	tp.CacheSalt = cacheSaltFromBody(request.Body)
-
+	if tp == nil || tp.TokenCount() == 0 {
+		return nil
+	}
+	tp.CacheSalt = CacheSaltFromBody(request.Body)
 	request.Body.TokenizedPrompt = tp
 	return nil
 }
@@ -255,8 +369,9 @@ func ChatCompletionsToRenderChatRequest(chat *fwkrh.ChatCompletionsRequest) *tok
 	conversation := make([]tokenizerTypes.Conversation, 0, len(chat.Messages))
 	for _, msg := range chat.Messages {
 		conv := tokenizerTypes.Conversation{
-			Role:    msg.Role,
-			Content: tokenizerTypes.Content{Raw: msg.Content.Raw},
+			Role:      msg.Role,
+			Content:   tokenizerTypes.Content{Raw: msg.Content.Raw},
+			ToolCalls: msg.ToolCalls,
 		}
 		for _, block := range msg.Content.Structured {
 			conv.Content.Structured = append(conv.Content.Structured, tokenizerTypes.ContentBlock{
@@ -278,6 +393,72 @@ func ChatCompletionsToRenderChatRequest(chat *fwkrh.ChatCompletionsRequest) *tok
 		AddGenerationPrompt:       chat.AddGenerationPrompt,
 		ChatTemplateKWArgs:        chat.ChatTemplateKWArgs,
 	}
+}
+
+// MessagesToRenderChatRequest converts an Anthropic MessagesRequest to a
+// tokenization RenderChatRequest for vLLM /render endpoint with System, Message and Tools set in RenderChatRequest only.
+func MessagesToRenderChatRequest(msg *fwkrh.MessagesRequest) *tokenizerTypes.RenderChatRequest {
+	conversation := make([]tokenizerTypes.Conversation, 0, 1+len(msg.Messages))
+
+	if msg.System.Raw != "" || len(msg.System.Structured) > 0 {
+		conversation = append(conversation, tokenizerTypes.Conversation{
+			Role:    "system",
+			Content: convertAnthropicContent(msg.System),
+		})
+	}
+
+	for _, m := range msg.Messages {
+		conversation = append(conversation, tokenizerTypes.Conversation{
+			Role:    m.Role, // role: user, assistant, system
+			Content: convertAnthropicContent(m.Content),
+		})
+	}
+
+	return &tokenizerTypes.RenderChatRequest{
+		Conversation: conversation,
+		Tools:        msg.Tools,
+	}
+}
+
+// convertAnthropicContent converts an AnthropicContent to the kv-cache tokenizer Content type
+// mapping Anthropic image blocks to OpenAI-shaped image_url blocks.
+func convertAnthropicContent(ac fwkrh.AnthropicContent) tokenizerTypes.Content {
+	if ac.Raw != "" {
+		return tokenizerTypes.Content{Raw: ac.Raw}
+	}
+	blocks := make([]tokenizerTypes.ContentBlock, 0, len(ac.Structured))
+	for _, b := range ac.Structured {
+		switch b.Type {
+		case "text":
+			blocks = append(blocks, tokenizerTypes.ContentBlock{
+				Type: "text",
+				Text: b.Text,
+			})
+		case "image":
+			if url := anthropicImageToURL(b.Source); url != "" {
+				blocks = append(blocks, tokenizerTypes.ContentBlock{
+					Type:     "image_url",
+					ImageURL: tokenizerTypes.ImageBlock{URL: url},
+				})
+			}
+		}
+	}
+	return tokenizerTypes.Content{Structured: blocks}
+}
+
+// anthropicImageToURL converts an Anthropic image source to an OpenAI-shaped URL.
+// Base64 sources become data URIs; URL sources pass through.
+func anthropicImageToURL(src *fwkrh.AnthropicImageSource) string {
+	if src == nil {
+		return ""
+	}
+	if src.URL != "" {
+		return src.URL
+	}
+	if src.Data != "" {
+		return "data:" + src.MediaType + ";base64," + src.Data
+	}
+	return ""
 }
 
 // convertMMFeaturesToUpstream flattens the kv-cache map-shaped multimodal

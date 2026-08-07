@@ -5,7 +5,7 @@ metadata:
   labels:
     app: ${EPP_NAME}
 spec:
-  replicas: 1
+  replicas: ${EPP_REPLICA_COUNT}
   selector:
     matchLabels:
       app: ${EPP_NAME}
@@ -35,7 +35,9 @@ spec:
         - "9003"
         - --config-file
         - "/etc/epp/epp-config.yaml"
+        - --allow-experimental-plugins=true
         - --metrics-endpoint-auth=${METRICS_ENDPOINT_AUTH}
+        - --ha-enable-leader-election=${ENABLE_LEADER_ELECTION}
         ports:
         - containerPort: 5557
         - containerPort: 9002
@@ -106,7 +108,4 @@ spec:
         configMap:
           name: epp-config
       - name: cache
-        emptyDir: {}
-      # HuggingFace cache for the render sidecar's model weights.
-      - name: model-cache
         emptyDir: {}

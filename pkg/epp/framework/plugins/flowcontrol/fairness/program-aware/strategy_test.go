@@ -66,7 +66,7 @@ func TestFactory_InvalidStrategy(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestFactory_InvalidConfig(t *testing.T) {
+func TestFactory_InvalidStrategyConfig(t *testing.T) {
 	cases := []struct {
 		name    string
 		body    string
@@ -108,7 +108,7 @@ func makeQueueInfo(id string, queueLen int, metrics *ProgramMetrics, enqueueTime
 		Queue: &fwkfcmocks.MockFlowQueueAccessor{
 			LenV:     queueLen,
 			FlowKeyV: flowcontrol.FlowKey{ID: id},
-			PeekHeadV: &fwkfcmocks.MockQueueItemAccessor{
+			PeekV: &fwkfcmocks.MockQueueItemAccessor{
 				EnqueueTimeV:     enqueueTime,
 				OriginalRequestV: &fwkfcmocks.MockFlowControlRequest{IDV: id + "-req"},
 			},
@@ -456,15 +456,15 @@ func TestDRR_Pick_TokenHeavyProgramDeprioritized(t *testing.T) {
 	queueHeavy := &fwkfcmocks.MockFlowQueueAccessor{
 		LenV:     5,
 		FlowKeyV: flowcontrol.FlowKey{ID: "heavy"},
-		PeekHeadV: &fwkfcmocks.MockQueueItemAccessor{
+		PeekV: &fwkfcmocks.MockQueueItemAccessor{
 			EnqueueTimeV:     now,
-			OriginalRequestV: &fwkfcmocks.MockFlowControlRequest{IDV: "heavy-req-1"},
+			OriginalRequestV: &fwkfcmocks.MockFlowControlRequest{IDV: "alpha-req-1"},
 		},
 	}
 	queueLight := &fwkfcmocks.MockFlowQueueAccessor{
 		LenV:     1,
 		FlowKeyV: flowcontrol.FlowKey{ID: "light"},
-		PeekHeadV: &fwkfcmocks.MockQueueItemAccessor{
+		PeekV: &fwkfcmocks.MockQueueItemAccessor{
 			EnqueueTimeV:     now,
 			OriginalRequestV: &fwkfcmocks.MockFlowControlRequest{IDV: "light-req-1"},
 		},
@@ -651,7 +651,7 @@ func lasSeedState(s *LASStrategy, id string, service float64, lastDecay time.Tim
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.attainedService = service
-	st.lastDecay = lastDecay
+	st.decayAnchor = lastDecay
 }
 
 func TestLASStrategy_TimedDecay_HalvesAtHalfLife(t *testing.T) {
@@ -825,7 +825,7 @@ func TestRR_Pick_CyclesThroughPrograms(t *testing.T) {
 		return &fwkfcmocks.MockFlowQueueAccessor{
 			LenV:     1,
 			FlowKeyV: flowcontrol.FlowKey{ID: id},
-			PeekHeadV: &fwkfcmocks.MockQueueItemAccessor{
+			PeekV: &fwkfcmocks.MockQueueItemAccessor{
 				EnqueueTimeV:     now,
 				OriginalRequestV: &fwkfcmocks.MockFlowControlRequest{IDV: id + "-req"},
 			},
@@ -868,7 +868,7 @@ func TestDRR_Pick_QuantumAllocatedDuringPick(t *testing.T) {
 		return &fwkfcmocks.MockFlowQueueAccessor{
 			LenV:     1,
 			FlowKeyV: flowcontrol.FlowKey{ID: id},
-			PeekHeadV: &fwkfcmocks.MockQueueItemAccessor{
+			PeekV: &fwkfcmocks.MockQueueItemAccessor{
 				EnqueueTimeV:     now,
 				OriginalRequestV: &fwkfcmocks.MockFlowControlRequest{IDV: id + "-req"},
 			},

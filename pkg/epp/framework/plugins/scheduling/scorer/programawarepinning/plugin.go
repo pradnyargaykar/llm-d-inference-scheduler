@@ -291,7 +291,7 @@ func (s *ProgramAware) DumpState() (json.RawMessage, error) {
 
 // podKey returns the stable identifier used to pin a program to a pod.
 func podKey(pod fwksched.Endpoint) string {
-	return pod.GetMetadata().NamespacedName.String()
+	return pod.GetMetadata().GetNamespacedName().String()
 }
 
 // chosenPod returns the pod the picker selected for the primary profile, if any.

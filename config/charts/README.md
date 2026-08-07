@@ -7,7 +7,7 @@ This directory contains Helm charts for deploying the **llm-d Router** component
 We provide two charts depending on your deployment mode, both leveraging a shared core library chart (`routerlib`):
 
 *   **`llm-d-router-gateway`**: Used for **Gateway Mode**. It deploys EPP and creates an `InferencePool` resource. It integrates with the Kubernetes Gateway API (typically via `HTTPRoute` pointing to the `InferencePool`) for multi-pool, dynamic routing.
-*   **`llm-d-router-standalone`**: Used for **Standalone Mode** (Service-backed or direct pod routing). EPP can be deployed without creating an `InferencePool` resource (by setting `router.inferencePool.create=false`). It supports running EPP with a sidecar proxy (Envoy or Agentgateway) to intercept and route traffic.
+*   **`llm-d-router-standalone`**: Used for **Standalone Mode** (Service-backed or direct pod routing). EPP can be deployed without creating an `InferencePool` resource (by setting `router.inferencePool.create=false`). It supports running a proxy (Envoy or Agentgateway) to intercept and route traffic, either as a sidecar in the EPP pod or as a separate horizontally scalable service.
 *   **`routerlib` (Library Chart)**: Encapsulates the core templates and default configurations for EPP and `InferencePool`. It is not deployable on its own.
 
 ---
@@ -32,16 +32,27 @@ helm install my-standalone-router ./config/charts/llm-d-router-standalone \
   --set router.modelServers.matchLabels.app=my-vllm-service
 ```
 
-#### Standalone with Agentgateway Proxy (Service-Backed)
-Deploys EPP with an Agentgateway proxy. This mode requires disabling the `InferencePool` resource creation (`create=false`) and routes traffic to an existing Kubernetes Service:
+#### Standalone with Agentgateway Proxy
+Deploys EPP with an Agentgateway proxy. This mode requires disabling the `InferencePool` resource creation (`create=false`) and routes traffic directly to model servers:
 
 ```bash
 helm install my-standalone-router ./config/charts/llm-d-router-standalone \
   --set router.inferencePool.create=false \
   --set router.proxy.proxyType=agentgateway \
-  --set router.proxy.agentgateway.service.name=my-model-service \
-  --set router.proxy.agentgateway.service.ports="8000"
+  --set router.modelServers.matchLabels.app=my-model-service
 ```
+
+#### Standalone with a Separate Proxy Service
+Deploys the proxy as its own horizontally scalable Deployment and Service instead of as a sidecar in the EPP pod. The proxy reaches EPP over the EPP Service and fails open if EPP is unreachable, so the data path stays available across EPP active/passive failover:
+
+```bash
+helm install my-standalone-router ./config/charts/llm-d-router-standalone \
+  --set router.modelServers.matchLabels.app=my-vllm-service \
+  --set router.inferencePool.create=false \
+  --set router.proxy.mode=service \
+  --set router.proxy.replicas=3
+```
+
 ---
 
 ### 2. Gateway Mode (`llm-d-router-gateway`)
@@ -105,20 +116,21 @@ Core settings for the Endpoint Picker Proxy (EPP) container and pod, including s
 
 | **Parameter Name** | **Description** | **Default** |
 | :--- | :--- | :--- |
-| `router.epp.parser` | Request parser type for EPP. Options: `[openai-parser, anthropic-parser, vllmgrpc-parser, vllmhttp-parser, passthrough-parser]`. Empty for auto-selection. | `""` |
+| `router.epp.parsers` | List of request parser types for EPP. Options: `[openai-parser, anthropic-parser, vllmgrpc-parser, vllmhttp-parser, passthrough-parser]`. Empty for auto-selection. | `[]` |
 | `router.epp.replicas` | Number of EPP replicas. Set > 1 to enable multi-replica EPP. | `1` |
 | `router.epp.extProcPort` | Port EPP uses for external processing gRPC communication. | `9002` |
 | `router.epp.image.registry` | EPP container image registry. | `ghcr.io/llm-d` |
-| `router.epp.image.repository` | EPP container image repository. | `llm-d-router-endpoint-picker-dev` |
+| `router.epp.image.repository` | EPP container image repository. | `llm-d-router-endpoint-picker` |
 | `router.epp.image.tag` | EPP container image tag. | `main` |
 | `router.epp.image.pullPolicy` | EPP container image pull policy. | `Always` |
 | `router.epp.env` | Extra environment variables for EPP container. | `[]` |
 | `router.epp.extraContainerPorts` | Extra ports to expose on the EPP container. | `[]` |
 | `router.extraServicePorts` | Extra ports to expose on the EPP Service. | `[]` |
+| `router.clusterDomain` | Kubernetes cluster DNS domain used to build in-cluster Service FQDNs. | `cluster.local` |
 | `router.epp.flags` | Map of command-line flags passed directly to the EPP binary. | `{}` |
 | `router.epp.affinity` | Affinity rules for EPP pods. | `{}` |
 | `router.epp.tolerations` | Tolerations for EPP pods. | `[]` |
-| `router.epp.resources` | EPP container resource requests and limits. | `requests.cpu: "4"`, `requests.memory: 8Gi`, `limits.memory: 16Gi` |
+| `router.epp.resources` | EPP container resource requests and limits. | `requests.cpu: "8"`, `requests.memory: 8Gi`, `limits.memory: 16Gi` |
 | `router.epp.pluginsConfigFile` | EPP plugins configuration file name. | `default-plugins.yaml` |
 | `router.epp.pluginsCustomConfig` | Inline custom YAML configuration for EPP plugins. | `{}` |
 | `router.epp.volumes` | Extra volumes for EPP pod. | `[]` |
@@ -480,6 +492,12 @@ Configures routing policies, target Gateway interfaces, and priority objectives 
 | `provider.name` | Name of Gateway implementation. Options: `[none, gke, istio]`. | `none` |
 | `provider.istio.destinationRule.host` | Custom host value for Istio DestinationRule. | `""` |
 | `provider.istio.destinationRule.trafficPolicy.connectionPool` | Connection pool settings for Istio DestinationRule. | `{}` |
+| `provider.gke.preferredBackends.enabled` | Enable Preferred Backends high availability routing for GKE. | `false` |
+| `provider.gke.preferredBackends.preferredReplicas` | Replica count for primary active pod ordinals pinned to PREFERRED tier. | `1` |
+| `provider.gke.preferredBackends.defaultReplicas` | Replica count for standby backup pod ordinals pinned to DEFAULT tier. | `1` |
+| `provider.gke.preferredBackends.balancingMode` | Load balancing calculation mode (`RATE`, `UTILIZATION`, `CONNECTION`). | `RATE` |
+| `provider.gke.preferredBackends.maxRatePerEndpoint` | Maximum requests per second per pod instance before spilling over. | `100` |
+| `provider.gke.preferredBackends.capacityScalerPercent` | Effective capacity ceiling percentage (`0` to `100`). | `100` |
 | `httpRoute.create` | Deploy an `HTTPRoute` resource as part of the gateway chart. | `false` |
 | `httpRoute.inferenceGatewayName` | Target Gateway name for the `HTTPRoute`. | `inference-gateway` |
 | `httpRoute.inferenceGatewayNamespace` | Target Gateway namespace for the `HTTPRoute`. | `""` |
@@ -490,6 +508,14 @@ Configures routing policies, target Gateway interfaces, and priority objectives 
 ```yaml
 provider:
   name: gke # Use GKE gateway implementation
+  gke:
+    preferredBackends:
+      enabled: true
+      preferredReplicas: 1
+      defaultReplicas: 1
+      balancingMode: RATE
+      maxRatePerEndpoint: 100
+      capacityScalerPercent: 100
   
 httpRoute:
   create: true
@@ -502,14 +528,17 @@ httpRoute:
 
 ### Standalone Mode Configuration
 
-Configures EPP to run with a sidecar proxy container (Envoy proxy or Agentgateway proxy) to intercept and route client traffic directly to model servers (exclusive to `llm-d-router-standalone`).
+Configures EPP to run with a proxy (Envoy proxy or Agentgateway proxy) that intercepts and routes client traffic directly to model servers (exclusive to `llm-d-router-standalone`). The proxy runs as a sidecar in the EPP pod by default, or as a separate horizontally scalable service when `router.proxy.mode=service`.
 
 #### Proxy Sidecar Parameters
 
 | **Parameter Name** | **Description** | **Default** |
 | :--- | :--- | :--- |
-| `router.proxy.enabled` | Enable a sidecar proxy container in the EPP deployment. | `false` |
-| `router.proxy.proxyType` | **Standalone only**. Type of sidecar proxy. Options: `[envoy, agentgateway]`. | `envoy` |
+| `router.proxy.enabled` | Enable the proxy (Envoy or Agentgateway) in front of EPP. | `false` |
+| `router.proxy.proxyType` | Type of proxy. Options: `[envoy, agentgateway]`. | `envoy` |
+| `router.proxy.mode` | Proxy deployment mode. `sidecar` runs the proxy in the EPP pod; `service` runs it as its own horizontally scalable Deployment and Service reaching EPP over the EPP Service. | `sidecar` |
+| `router.proxy.replicas` | Replica count for the proxy Deployment when `mode=service`. | `2` |
+| `router.proxy.failOpen` | Whether the proxy passes traffic through (fail-open) when EPP is unreachable. Applies to `proxyType=envoy` only; Agentgateway exposes no fail-open setting and rejects requests (fails closed) when EPP is unreachable. | `true` |
 | `router.proxy.name` | Name of the sidecar container. | `""` |
 | `router.proxy.image` | Sidecar container image. | `""` |
 | `router.proxy.imagePullPolicy` | Sidecar container image pull policy. | `IfNotPresent` |
@@ -523,19 +552,20 @@ Configures EPP to run with a sidecar proxy container (Envoy proxy or Agentgatewa
 | `router.proxy.volumeMounts` | Sidecar container volume mounts. | `[]` |
 | `router.proxy.volumes` | Sidecar container volumes. | `[]` |
 | `router.proxy.configMapData` | Key-value pairs to include in a ConfigMap created for the sidecar. | `{}` |
-| `router.proxy.agentgateway.service.create` | **Agentgateway only**. Create a dedicated model Service for the Agentgateway proxy. | `true` |
-| `router.proxy.agentgateway.service.name` | **Agentgateway only**. Name of the model Service to route to. | `""` |
-| `router.proxy.agentgateway.service.namespace` | **Agentgateway only**. Namespace of the model Service. Defaults to release namespace. | `""` |
-| `router.proxy.agentgateway.service.ports` | **Agentgateway only**. Port list for the model Service (must match `modelServers.targetPorts`). | `[]` |
+#### Complete Standalone Example with Agentgateway Proxy
 
-#### Complete Proxy Sidecar Example (Agentgateway Service-Backed)
-
-To deploy EPP in standalone mode with an Agentgateway sidecar routing traffic directly to an existing model Service `my-model-service` (bypassing `InferencePool` creation):
+To deploy EPP in standalone mode with an Agentgateway sidecar routing traffic directly to model servers matching the label `app=my-model-service` (bypassing `InferencePool` creation):
 
 ```yaml
 router:
   inferencePool:
     create: false # Disable InferencePool creation
+
+  modelServers:
+    matchLabels:
+      app: "my-model-service"
+    targetPorts:
+      - number: 8000
 
   proxy:
     enabled: true
@@ -546,10 +576,4 @@ router:
         memory: 4Gi
       limits:
         memory: 8Gi
-    agentgateway:
-      service:
-        create: true # Create a Service to route client traffic to EPP
-        name: "my-model-service"
-        ports:
-          - 8000 # Intercept traffic on port 8000
 ```

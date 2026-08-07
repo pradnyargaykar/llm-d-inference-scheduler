@@ -23,11 +23,20 @@ const (
 type PrefixBasedPDDeciderConfig struct {
 	// NonCachedTokens non cached minimum tokens that triggers disaggregated PD
 	NonCachedTokens int `json:"nonCachedTokens"`
+
+	// PromptTokens is the minimum estimated prompt length in tokens (approximated
+	// as character-count / AverageCharactersPerToken) required before applying
+	// prefix-cache-based disaggregation logic. Zero disables this prompt-length gate.
+	PromptTokens int `json:"promptTokens"`
 }
 
 func (p PrefixBasedPDDeciderConfig) validate() error {
 	if p.NonCachedTokens < 0 {
 		return errors.New("nonCachedTokens parameter of prefix disaggregation decider cannot be negative")
+	}
+
+	if p.PromptTokens < 0 {
+		return errors.New("promptTokens parameter of prefix disaggregation decider cannot be negative")
 	}
 
 	return nil
@@ -48,6 +57,7 @@ func PrefixBasedPDDeciderPluginFactory(name string, rawParameters *json.Decoder,
 	handle plugin.Handle) (plugin.Plugin, error) {
 	config := PrefixBasedPDDeciderConfig{
 		NonCachedTokens: 0,
+		PromptTokens:    0,
 	}
 
 	if rawParameters != nil {
@@ -110,6 +120,12 @@ func (d *PrefixBasedPDDecider) disaggregate(ctx context.Context, request *schedu
 		logger.Error(err, "prefix decider: failed to get user input length in tokens")
 		return false
 	}
+
+	if d.config.PromptTokens > 0 && inputTokens < d.config.PromptTokens {
+		debugLogger.Info("Input is shorter than the promptTokens, no disaggregated PD")
+		return false
+	}
+
 	if inputTokens < d.config.NonCachedTokens {
 		debugLogger.Info("Input is shorter than the nonCachedToken, no disaggregated PD")
 		return false
@@ -127,8 +143,11 @@ func (d *PrefixBasedPDDecider) disaggregate(ctx context.Context, request *schedu
 		return false
 	}
 
-	// number of cached tokens
-	hitPrefixTokens := prefixCacheMatchInfo.MatchBlocks() * prefixCacheMatchInfo.BlockSizeTokens()
+	// number of cached tokens. Use the unweighted cached-block count, not the
+	// tier-weighted match score: a RAM-cached prefix must contribute its full
+	// token count here, otherwise the non-cached suffix is overestimated and
+	// requests with large local-RAM hits are misrouted to remote prefill.
+	hitPrefixTokens := prefixCacheMatchInfo.CachedBlockCount() * prefixCacheMatchInfo.BlockSizeTokens()
 	// length of non-cached suffix in tokens
 	nonCachedTokens := inputTokens - hitPrefixTokens
 
@@ -151,7 +170,7 @@ func getUserInputLenInTokens(request *scheduling.InferenceRequest) (int, error) 
 	}
 
 	if tp := request.Body.TokenizedPrompt; tp != nil {
-		return len(tp.TokenIDs), nil
+		return tp.TokenCount(), nil
 	}
 	return 0, nil
 }

@@ -33,13 +33,15 @@ SIDECAR_IMAGE_TAG_BASE ?= $(IMAGE_REGISTRY)/$(SIDECAR_IMAGE_NAME)
 SIDECAR_TAG ?= dev
 export SIDECAR_IMAGE ?= $(SIDECAR_IMAGE_TAG_BASE):$(SIDECAR_TAG)
 
-VLLM_SIMULATOR_TAG ?= v0.9.0
+VLLM_SIMULATOR_TAG ?= v0.10.2
 VLLM_SIMULATOR_TAG_BASE ?= $(IMAGE_REGISTRY)/$(VLLM_SIMULATOR_IMAGE_NAME)
 export VLLM_IMAGE ?= $(VLLM_SIMULATOR_TAG_BASE):$(VLLM_SIMULATOR_TAG)
 
 # CPU-only vLLM image that exposes `vllm launch render` for the token-producer
 # plugin's HTTP backend.
 export VLLM_RENDER_IMAGE ?= vllm/vllm-openai-cpu:v0.21.0
+export VLLM_RENDER_PORT ?= 8082
+export VLLM_RENDER_URL ?= http://vllm-render:$(VLLM_RENDER_PORT)
 
 BUILDER_TAG ?= dev
 BUILDER_TAG_BASE ?= $(IMAGE_REGISTRY)/$(BUILDER_IMAGE_NAME)
@@ -55,6 +57,7 @@ GIT_COMMIT_SHA ?= $(shell git rev-parse HEAD 2>/dev/null)
 # Match only root-level release tags (v[0-9]*) so submodule tags don't leak into image versions.
 ROOT_RELEASE_TAG_MATCH ?= v[0-9]*
 BUILD_REF ?= $(shell git describe --tags --match '$(ROOT_RELEASE_TAG_MATCH)' --abbrev=0 2>/dev/null)
+LATENCY_PREDICTOR_TAG ?= $(or $(EXTRA_TAG),$(BUILD_REF),latest)
 
 # Host directories for Go module and build caches, bind-mounted into the builder container.
 GO_MOD_CACHE_VOL ?= $(HOME)/.cache/llm-d-gomodcache
@@ -105,28 +108,29 @@ DOCKER_SOCK_GID := $(shell stat -f '%g' $(CONTAINER_SOCK) 2>/dev/null)
 else
 DOCKER_SOCK_GID := $(shell stat -c '%g' $(CONTAINER_SOCK) 2>/dev/null)
 endif
-BUILDER_SOCK_FLAGS = --group-add $(DOCKER_SOCK_GID) \
+ifneq ($(DOCKER_SOCK_GID),)
+DOCKER_GROUP_PARAM := --group-add $(DOCKER_SOCK_GID)
+else
+DOCKER_GROUP_PARAM :=
+endif
+BUILDER_SOCK_FLAGS = $(DOCKER_GROUP_PARAM) \
 	-v $(CONTAINER_SOCK):$(CONTAINER_SOCK) \
 	-e DOCKER_HOST=unix://$(CONTAINER_SOCK) \
 	-e CONTAINER_RUNTIME=docker
 endif
+
+E2E_NUM_PROCS ?= 5
 
 # Env vars forwarded into the e2e test container.
 # Add new image vars here so they are automatically passed through.
 # Should we pass ALL env vars here?
 E2E_ENV_VARS = EPP_IMAGE VLLM_IMAGE SIDECAR_IMAGE VLLM_RENDER_IMAGE \
                E2E_KEEP_CLUSTER_ON_FAILURE E2E_PORT E2E_METRICS_PORT K8S_CONTEXT READY_TIMEOUT \
-               E2E_LABEL_FILTER LOAD_VLLM_RENDER_IMAGE
+               E2E_NUM_PROCS LOAD_VLLM_RENDER_IMAGE HF_TOKEN
 BUILDER_E2E_ENV_FLAGS = $(foreach v,$(E2E_ENV_VARS),$(if $($(v)),-e '$(v)=$($(v))'))
 ifneq ($(filter command line environment,$(origin NAMESPACE)),)
 BUILDER_E2E_ENV_FLAGS += -e NAMESPACE=$(NAMESPACE)
 endif
-
-# GAIE e2e test variables (for test-e2e-gaie target).
-# GAIE_E2E_MANIFEST_PATH: path to the model server manifest inside the builder container
-# (/app/... prefix). Defaults to the sim-deployment in testdata. Override to use a GPU manifest.
-GAIE_E2E_MANIFEST_PATH ?=
-GAIE_E2E_IMAGE         ?= $(EPP_IMAGE)
 
 # When K8S_CONTEXT is set, mount the host kubeconfig so the e2e suite can call
 # config.GetConfigWithContext(K8S_CONTEXT) against an existing cluster instead of
@@ -157,8 +161,13 @@ LDFLAGS ?= -s -w
 BASE_IMAGE ?=
 
 # test packages
-epp_TEST_PACKAGES = $$(go list ./... | grep -v /test/ | grep -v ./pkg/sidecar/ | tr '\n' ' ')
+epp_TEST_PACKAGES = $$(go list ./... | grep -v /test/ | grep -v ./pkg/sidecar/ | grep -v ./pkg/coordinator/ | grep -v ./cmd/coordinator | tr '\n' ' ')
 sidecar_TEST_PACKAGES = ./pkg/sidecar/...
+# framework is intentionally absent from the worktree coverage-compare baseline
+# block (epp+sidecar only); CI's baseline cache unions all coverage/*.out, so
+# framework enters the CI baseline once this is on main. The PR run reports
+# coverage/framework.out as a new component.
+framework_TEST_PACKAGES = ./test/framework/...
 
 # Internal variables for generic targets
 epp_IMAGE = $(EPP_IMAGE)
@@ -199,9 +208,17 @@ vulncheck: image-build-builder ## Run govulncheck for known vulnerabilities
 	@printf "\033[33;1m==== Running govulncheck ====\033[0m\n"
 	$(BUILDER_RUN) 'govulncheck ./...'
 
+.PHONY: check-latest-tags
+check-latest-tags: ## Check ':latest' image tags in YAML (warn-only; use check-latest-tags-strict to fail)
+	@./scripts/check-latest-tags.sh --warn
+
+.PHONY: check-latest-tags-strict
+check-latest-tags-strict: ## Check ':latest' image tags in YAML (strict; fails on any violation)
+	@./scripts/check-latest-tags.sh
+
 .PHONY: presubmit
 presubmit: LINT_NEW_ONLY=true
-presubmit: git-branch-check signed-commits-check go-mod-check format lint vulncheck
+presubmit: git-branch-check signed-commits-check go-mod-check format lint vulncheck check-latest-tags-strict
 
 .PHONY: git-branch-check
 git-branch-check:
@@ -243,11 +260,20 @@ lint: image-build-builder ## Run lint (use LINT_NEW_ONLY=true to only check new 
 	@printf "\033[33;1m==== Running linting ====\033[0m\n"
 	$(BUILDER_RUN) 'GOFLAGS=-buildvcs=false golangci-lint run $(LINT_ARGS) && typos'
 
+# Reports findings without failing while the initial baseline is triaged.
+# Set to 1 to block merges on new findings.
+SECURITY_LINT_EXIT_CODE ?= 0
+
+.PHONY: lint-security
+lint-security: image-build-builder ## Run security linters and write gosec.sarif
+	@printf "\033[33;1m==== Running security linting ====\033[0m\n"
+	$(BUILDER_RUN) 'GOFLAGS=-buildvcs=false golangci-lint run --config=./.golangci-security.yml --issues-exit-code=$(SECURITY_LINT_EXIT_CODE)'
+
 .PHONY: test
 test: test-unit test-e2e ## Run all tests (unit and e2e)
 
 .PHONY: test-unit
-test-unit: test-unit-epp test-unit-sidecar ## Run unit tests
+test-unit: test-unit-epp test-unit-sidecar test-unit-framework ## Run unit tests
 
 .PHONY: test-unit-%
 test-unit-%: image-build-builder
@@ -284,30 +310,16 @@ test-integration-hermetic: image-build-builder ## Run hermetic integration tests
 	$(BUILDER_RUN) 'CGO_ENABLED=1 KUBEBUILDER_ASSETS="$$(setup-envtest use $$ENVTEST_K8S_VERSION --bin-dir $$ENVTEST_ASSETS_DIR -p path)" go test -v -race $(if $(PATTERN),-run "$(PATTERN)",) -coverprofile=$(COVERAGE_DIR)/integration-hermetic.out -covermode=atomic ./test/integration/...'
 	$(BUILDER_RUN) 'go tool cover -func=$(COVERAGE_DIR)/integration-hermetic.out | tail -1'
 
-.PHONY: test-e2e-gaie-run
-test-e2e-gaie-run: image-pull ## Ensure images are present, then run GAIE e2e tests
-	@printf "\033[33;1m==== Running GAIE End to End Tests ====\033[0m\n"
-	$(CONTAINER_RUNTIME) run $(BUILDER_RUN_FLAGS) $(BUILDER_E2E_FLAGS) \
-		-e EPP_IMAGE=$(GAIE_E2E_IMAGE) \
-		-e USE_KIND=true \
-		$(BUILDER_IMAGE) ./hack/test-e2e.sh
 
-.PHONY: test-e2e-gaie
-test-e2e-gaie: image-build-builder image-build ## Build images and run GAIE e2e tests
-	$(MAKE) test-e2e-gaie-run
-
-.PHONY: test-e2e-scheduler-run
-test-e2e-scheduler-run: image-pull ## Ensure images are present, then run scheduler e2e tests
+.PHONY: test-e2e-run
+test-e2e-run: image-pull ## Ensure images are present, then run e2e tests
 	@printf "\033[33;1m==== Running End to End Tests ====\033[0m\n"
 	$(CONTAINER_RUNTIME) run $(BUILDER_RUN_FLAGS) $(BUILDER_E2E_FLAGS) \
-		$(BUILDER_IMAGE) ./test/scripts/run_e2e.sh
-
-.PHONY: test-e2e-scheduler
-test-e2e-scheduler: image-build-builder image-build ## Build images and run scheduler e2e tests
-	$(MAKE) test-e2e-scheduler-run
+		$(BUILDER_IMAGE) ./test/scripts/test-e2e-router.sh
 
 .PHONY: test-e2e
-test-e2e: test-e2e-gaie test-e2e-scheduler ## Run all end-to-end tests sequentially
+test-e2e: image-build-builder image-build ## Build images and run e2e tests
+	$(MAKE) test-e2e-run
 
 
 .PHONY: bench-tokenizer
@@ -316,6 +328,11 @@ bench-tokenizer: image-build-builder ## Run external tokenizer + scorer benchmar
 	@printf "Ensure the kind cluster is running with the external tokenizer config.\n"
 	@printf "Run 'EXTERNAL_TOKENIZER_ENABLED=true KV_CACHE_ENABLED=true make env-dev-kind' first.\n\n"
 	$(BUILDER_RUN_CLUSTER) 'go test -bench=. -benchmem -count=5 -timeout=5m ./test/profiling/tokenizerbench/'
+
+.PHONY: bench-smoke
+bench-smoke: image-build-builder ## Smoke-run the flowcontrol benchmarks once (-benchtime=1x) to catch runtime rot
+	@printf "\033[33;1m==== Running Flow Control Benchmark Smoke ====\033[0m\n"
+	$(BUILDER_RUN) 'go test -run=^$$ -bench=. -benchtime=1x -timeout=5m ./pkg/epp/flowcontrol/benchmark/...'
 
 .PHONY: post-deploy-test
 post-deploy-test: ## Run post deployment tests
@@ -335,7 +352,7 @@ verify-helm-charts: helm-install kubectl-validate ## Render and validate Helm ch
 .PHONY: helm-push
 helm-push: yq helm-install ## Package and push a specified Helm chart. Usage: make helm-push CHART=<chart_name>
 	@if [ -z "$(CHART)" ]; then echo "Error: CHART variable is required (e.g. CHART=llm-d-router-standalone)"; exit 1; fi
-	CHART=$(CHART) EXTRA_TAG="$(EXTRA_TAG)" CHART_SUFFIX="$(CHART_SUFFIX)" EPP_RELEASE_IMAGE_REPOSITORY="$(EPP_RELEASE_IMAGE_REPOSITORY)" YQ="$(YQ)" HELM="$(HELM)" ./hack/push-chart.sh
+	CHART=$(CHART) EXTRA_TAG="$(EXTRA_TAG)" CHART_SUFFIX="$(CHART_SUFFIX)" EPP_RELEASE_IMAGE_REPOSITORY="$(EPP_RELEASE_IMAGE_REPOSITORY)" LATENCY_PREDICTOR_TAG="$(LATENCY_PREDICTOR_TAG)" YQ="$(YQ)" HELM="$(HELM)" ./hack/push-chart.sh
 
 .PHONY: helm-push-gateway
 helm-push-gateway: ## Package and push the llm-d-router-gateway Helm chart.
@@ -346,6 +363,22 @@ helm-push-standalone: ## Package and push the llm-d-router-standalone Helm chart
 	$(MAKE) helm-push CHART=llm-d-router-standalone
 
 
+##@ Release
+
+BUNDLE_VERSION ?= main-dev
+export BUNDLE_VERSION
+
+.PHONY: artifacts
+artifacts: generate yq check-kustomize ## Generate release artifacts (CRD manifests).
+	if [ -d artifacts ]; then rm -rf artifacts; fi
+	mkdir -p artifacts
+	kubectl kustomize config/crd > artifacts/manifests_all.yaml
+	$(YQ) -P 'select(.spec.group == "llm-d.ai")' artifacts/manifests_all.yaml > artifacts/manifests.yaml
+	rm -f artifacts/manifests_all.yaml
+	$(YQ) -P 'select(.spec.versions | map(.name == "v1") | any)' artifacts/manifests.yaml > artifacts/v1-manifests.yaml
+	$(YQ) -P 'select(.spec.versions | map(.name != "v1") | all)' artifacts/manifests.yaml > artifacts/experimental-manifests.yaml
+
+
 ##@ Coverage
 
 COVERAGE_DIR       ?= coverage
@@ -354,7 +387,7 @@ COVERAGE_LABEL     ?= main
 BASE_REF           ?= main
 
 .PHONY: test-coverage
-test-coverage: test-unit-epp test-unit-sidecar ## Run all unit tests with coverage (alias for test-unit)
+test-coverage: test-unit ## Run all unit tests with coverage (alias for test-unit)
 
 .PHONY: test-coverage-integration
 test-coverage-integration: test-integration ## Run integration tests with coverage (alias for test-integration)

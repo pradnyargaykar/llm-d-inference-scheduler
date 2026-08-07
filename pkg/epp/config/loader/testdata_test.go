@@ -44,7 +44,7 @@ schedulingProfiles:
     weight: 50
   - pluginRef: testPicker
 featureGates:
-- dataLayer
+- test-feature-gate
 - flowControl
 flowControl:
   saturationDetector:
@@ -76,11 +76,81 @@ schedulingProfiles:
     weight: 50
   - pluginRef: testPicker
 featureGates:
-- dataLayer
+- test-feature-gate
 - flowControl
 flowControl:
   saturationDetector:
     pluginRef: utilization-detector
+`
+
+// pluginsInOrderText represents a valid config with a plugin that is dependent
+// on another plugin. In this case the dependency is before the dependent plugin
+const pluginsInOrderText = `
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: test1
+  type: test-plugin
+- type: test-with-dependencies
+  parameters:
+    dependency: test1
+`
+
+// pluginsOutOfOrderText represents a valid config with a plugin that is dependent
+// on another plugin. In this case the dependent plugin is before the dependency
+const pluginsOutOfOrderText = `
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: test-with-dependencies
+  parameters:
+    dependency: test1
+- name: test1
+  type: test-plugin
+`
+
+// pluginsRefedByPointerText represents a valid config with a plugin that is dependent
+// on another plugin. In this case the dependent plugin is before the dependency and is
+// referenced via a pointer
+const pluginsRefedByPointerText = `
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: test-with-dependencies
+  parameters:
+    dependency: test1
+    pointedTo:  test2
+- name: test1
+  type: test-plugin
+- name: test2
+  type: test-scorer
+`
+
+// pluginsRefedByPointerText represents a valid config with a plugin that is dependent
+// on another plugin. In this case the dependent plugin is before the dependency and is
+// referenced via a pointer
+const pluginsRefedInNestedingText = `
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: test-with-nested-dependencies
+  parameters:
+    nested:
+      dependency: test1
+    pointedTo:  test2
+    nestedPtr:
+      dependency: test2
+    extras:
+    - test4
+    - test3
+- name: test1
+  type: test-plugin
+- name: test2
+  type: test-scorer
+- name: test3
+  type: test-source
+- name: test4
+  type: test-extractor
 `
 
 // successNoProfilesText represents a valid config with plugins but no profiles.
@@ -93,6 +163,8 @@ plugins:
   type: test-plugin
   parameters:
     threshold: 10
+featureGates:
+- test-feature-gate=false
 `
 
 // successSchedulerConfigText represents a complex scheduler setup.
@@ -124,7 +196,7 @@ dataLayer:
     extractors:
     - pluginRef: testExtractor
 featureGates:
-- dataLayer
+- test-feature-gate
 - flowControl
 `
 
@@ -202,9 +274,57 @@ schedulingProfiles:
 - name: default
   plugins:
   - pluginRef: maxScore
-featureGates: [] # Explicitly empty
+featureGates: ["flowControl=false"] # Explicit opt-out.
 flowControl:
   maxBytes: "1024"
+`
+
+// successFlowControlConfigNoGatesText carries flowControl settings with no featureGates stanza, so
+// the section is ignored under the gate's disabled default.
+const successFlowControlConfigNoGatesText = `
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: maxScore
+  type: max-score-picker
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: maxScore
+flowControl:
+  maxBytes: "1024"
+`
+
+// successFlowControlDisabledNoSectionText is the plain legacy-path config: an explicit opt-out with
+// nothing for the loader to report as ignored.
+const successFlowControlDisabledNoSectionText = `
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: maxScore
+  type: max-score-picker
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: maxScore
+featureGates: ["flowControl=false"]
+`
+
+// successFlowControlDisabledSaturationDetectorText pairs an explicit opt-out with a saturation
+// detector, which the legacy admission path honors and so must not be reported as ignored.
+const successFlowControlDisabledSaturationDetectorText = `
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: maxScore
+  type: max-score-picker
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: maxScore
+featureGates: ["flowControl=false"]
+saturationDetector:
+  pluginRef: utilization-detector
 `
 
 // successComplexFlowControlConfigText tests that Flow Control configuration with custom plugins is correctly loaded.
@@ -299,6 +419,74 @@ requestHandler:
   - pluginRef: secondParser
 `
 
+// successDataLayerAutoDefaultText has the datalayer enabled without data config.
+// The loader should auto-populate default datalayer plugins.
+// successDataLayerAutoDefaultText has NO featureGates — datalayer is enabled by default.
+const successDataLayerAutoDefaultText = `
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: maxScore
+  type: max-score-picker
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: maxScore
+`
+
+// successDataLayerNoSourcesText has an explicit empty dataLayer section with no sources.
+// The loader should additively inject the default metrics source because InjectDefaults is unset (default: true).
+const successDataLayerNoSourcesText = `
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: maxScore
+  type: max-score-picker
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: maxScore
+dataLayer: {}
+`
+
+// successDataLayerOptOutText has dataLayer with injectDefaults: false, disabling automatic injection.
+const successDataLayerOptOutText = `
+apiVersion: inference.networking.x-k8s.io/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: maxScore
+  type: max-score-picker
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: maxScore
+dataLayer:
+  injectDefaults: false
+`
+
+// successDataLayerExplicitConfigText has the datalayer enabled with an explicit non-metrics source.
+// The loader should inject the default metrics source in addition to the user's source (additive).
+const successDataLayerExplicitConfigText = `
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: maxScore
+  type: max-score-picker
+- name: testSource
+  type: test-source
+- name: testExtractor
+  type: test-extractor
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: maxScore
+dataLayer:
+  sources:
+  - pluginRef: testSource
+    extractors:
+    - pluginRef: testExtractor
+`
+
 // --- Invalid Configurations (Syntax/Structure) ---
 
 // errorBadYamlText contains invalid YAML syntax.
@@ -358,6 +546,19 @@ plugins:
     threshold: 10
 featureGates:
 - unknown-gate
+`
+
+// errorBadFeatureGateText includes a feature gate with an invalid value
+const errorBadFeatureGateText = `
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: test1
+  type: test-plugin
+  parameters:
+    threshold: 10
+featureGates:
+- flowControl=qwerty
 `
 
 // --- Invalid Configurations (Logical/Architectural) ---
@@ -518,74 +719,21 @@ schedulingProfiles:
   - pluginRef: maxScore
 `
 
-// successDataLayerAutoDefaultText has the datalayer enabled without data config.
-// The loader should auto-populate default datalayer plugins.
-// successDataLayerAutoDefaultText has NO featureGates — datalayer is enabled by default.
-const successDataLayerAutoDefaultText = `
+// errorPluginsRefedInLoopText has a cycle in the plugin dependencies and should fail due to cycle detection
+const errorPluginsRefedInLoopText = `
 apiVersion: llm-d.ai/v1alpha1
 kind: EndpointPickerConfig
 plugins:
-- name: maxScore
-  type: max-score-picker
-schedulingProfiles:
-- name: default
-  plugins:
-  - pluginRef: maxScore
-`
-
-// successDataLayerNoSourcesText has an explicit empty dataLayer section with no sources.
-// The loader should additively inject the default metrics source because InjectDefaults is unset (default: true).
-const successDataLayerNoSourcesText = `
-apiVersion: llm-d.ai/v1alpha1
-kind: EndpointPickerConfig
-plugins:
-- name: maxScore
-  type: max-score-picker
-schedulingProfiles:
-- name: default
-  plugins:
-  - pluginRef: maxScore
-dataLayer: {}
-`
-
-// successDataLayerOptOutText has dataLayer with injectDefaults: false, disabling automatic injection.
-const successDataLayerOptOutText = `
-apiVersion: inference.networking.x-k8s.io/v1alpha1
-kind: EndpointPickerConfig
-plugins:
-- name: maxScore
-  type: max-score-picker
-schedulingProfiles:
-- name: default
-  plugins:
-  - pluginRef: maxScore
-dataLayer:
-  injectDefaults: false
-`
-
-// successDataLayerExplicitConfigText has the datalayer enabled with an explicit non-metrics source.
-// The loader should inject the default metrics source in addition to the user's source (additive).
-const successDataLayerExplicitConfigText = `
-apiVersion: llm-d.ai/v1alpha1
-kind: EndpointPickerConfig
-plugins:
-- name: maxScore
-  type: max-score-picker
-- name: testSource
-  type: test-source
-- name: testExtractor
-  type: test-extractor
-schedulingProfiles:
-- name: default
-  plugins:
-  - pluginRef: maxScore
-dataLayer:
-  sources:
-  - pluginRef: testSource
-    extractors:
-    - pluginRef: testExtractor
-featureGates:
-- dataLayer
+- type: test-with-dependencies
+  parameters:
+    dependency: test1
+    pointedTo:  test2
+- name: test1
+  type: test-with-dependencies
+  parameters:
+    dependency: test1
+- name: test2
+  type: test-scorer
 `
 
 // errorBadSourceReferenceText has a bad DataSource plugin reference
@@ -605,7 +753,7 @@ dataLayer:
   sources:
   - pluginRef: test-one
 featureGates:
-- dataLayer
+- test-feature-gate
 - flowControl
 `
 
@@ -629,7 +777,7 @@ dataLayer:
     extractors:
     - test-one
 featureGates:
-- dataLayer
+- test-feature-gate
 - flowControl
 `
 

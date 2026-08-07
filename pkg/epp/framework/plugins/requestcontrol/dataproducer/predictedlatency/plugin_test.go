@@ -20,11 +20,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
+	"github.com/jellydator/ttlcache/v3"
 	latencypredictor "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/predictedlatency/latencypredictorclient"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/types"
 
 	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
@@ -32,14 +35,18 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
 	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
-	igwtestutils "github.com/llm-d/llm-d-router/test/utils/igw"
+	testutils "github.com/llm-d/llm-d-router/test/utils"
 )
 
 // mockPredictor implements PredictorInterface for testing
 type mockPredictor struct {
 	predictions map[string]*latencypredictor.PredictionResponse
 	err         error
+	// capturedBulkStrictRequests records the requests passed to the most recent
+	// PredictBulkStrict call, so tests can assert what was sent to the predictor.
+	capturedBulkStrictRequests []latencypredictor.PredictionRequest
 }
 
 func (m *mockPredictor) Predict(ctx context.Context, request latencypredictor.PredictionRequest) (*latencypredictor.PredictionResponse, error) {
@@ -70,6 +77,7 @@ func (m *mockPredictor) PredictBulk(ctx context.Context, requests []latencypredi
 }
 
 func (m *mockPredictor) PredictBulkStrict(ctx context.Context, requests []latencypredictor.PredictionRequest) (*latencypredictor.BulkPredictionResponse, error) {
+	m.capturedBulkStrictRequests = requests
 	if m.err != nil {
 		return nil, m.err
 	}
@@ -101,9 +109,27 @@ func (m *mockPredictor) GetServerStatus(ctx context.Context) (*latencypredictor.
 	return &latencypredictor.ServerStatusResponse{}, nil
 }
 
+func TestReadInFlightLoad(t *testing.T) {
+	pl := &PredictedLatency{inFlightLoadDataKey: attrconcurrency.InFlightLoadDataKey}
+
+	// Fallback path (no InFlightLoad attribute): tokens are zero and requests
+	// fall back to vLLM metrics. Both fields are always set.
+	ep := createTestEndpoint("pod1", 0.5, 5, 0)
+	got := pl.readInFlightLoad(ep)
+	assert.Equal(t, int64(0), got.tokens, "tokens must be zero on the fallback path")
+	assert.Equal(t, 5, got.requests, "requests falls back to metrics RunningRequestsSize")
+
+	// Attribute present: both fields come from InFlightLoad.
+	epWithLoad := createTestEndpoint("pod2", 0.5, 5, 0)
+	epWithLoad.Put(attrconcurrency.InFlightLoadDataKey.String(), &attrconcurrency.InFlightLoad{Tokens: 42, Requests: 3})
+	got = pl.readInFlightLoad(epWithLoad)
+	assert.Equal(t, int64(42), got.tokens)
+	assert.Equal(t, 3, got.requests)
+}
+
 func createTestEndpoint(name string, kvCacheUsage float64, runningRequestsSize, waitingQueueSize int) fwksched.Endpoint {
 	return fwksched.NewEndpoint(&fwkdl.EndpointMetadata{
-		NamespacedName: types.NamespacedName{
+		ID: types.NamespacedName{
 			Name:      name,
 			Namespace: "default",
 		}},
@@ -121,7 +147,7 @@ func createTestInferenceRequest(reqID string, ttftSLO, tpotSLO float64) *fwksche
 		Completions: &fwkrh.CompletionsRequest{
 			Prompt: fwkrh.Prompt{Raw: "test prompt"},
 		},
-		TokenizedPrompt: &fwkrh.TokenizedPrompt{TokenIDs: make([]uint32, 2)},
+		TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{make([]uint32, 2)}},
 	})
 }
 
@@ -133,7 +159,7 @@ func createTestChatCompletionsInferenceRequest(reqID string, ttftSLO, tpotSLO fl
 				{Role: "user", Content: fwkrh.Content{Raw: "Tell me a joke."}},
 			},
 		},
-		TokenizedPrompt: &fwkrh.TokenizedPrompt{TokenIDs: make([]uint32, 8)},
+		TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{make([]uint32, 8)}},
 	})
 }
 
@@ -244,8 +270,8 @@ func TestPredictedLatency_GetPodRunningRequestCount(t *testing.T) {
 			name: "One running request",
 			setupRequests: func(r *PredictedLatency, p fwksched.Endpoint) {
 				podName := types.NamespacedName{
-					Name:      p.GetMetadata().NamespacedName.Name,
-					Namespace: p.GetMetadata().NamespacedName.Namespace,
+					Name:      p.GetMetadata().ID.Name,
+					Namespace: p.GetMetadata().ID.Namespace,
 				}
 				queue := newRequestPriorityQueue()
 				queue.Add("req1", 0.04)
@@ -257,8 +283,8 @@ func TestPredictedLatency_GetPodRunningRequestCount(t *testing.T) {
 			name: "Multiple running requests",
 			setupRequests: func(r *PredictedLatency, p fwksched.Endpoint) {
 				endpointName := types.NamespacedName{
-					Name:      p.GetMetadata().NamespacedName.Name,
-					Namespace: p.GetMetadata().NamespacedName.Namespace,
+					Name:      p.GetMetadata().ID.Name,
+					Namespace: p.GetMetadata().ID.Namespace,
 				}
 				queue := newRequestPriorityQueue()
 				queue.Add("req1", 0.04)
@@ -300,8 +326,8 @@ func TestPredictedLatency_GetPodMinTPOTSLO(t *testing.T) {
 			name: "One running request",
 			setupRequests: func(r *PredictedLatency, e fwksched.Endpoint) {
 				endpointName := types.NamespacedName{
-					Name:      e.GetMetadata().NamespacedName.Name,
-					Namespace: e.GetMetadata().NamespacedName.Namespace,
+					Name:      e.GetMetadata().ID.Name,
+					Namespace: e.GetMetadata().ID.Namespace,
 				}
 				queue := newRequestPriorityQueue()
 				queue.Add("req1", 0.04)
@@ -313,8 +339,8 @@ func TestPredictedLatency_GetPodMinTPOTSLO(t *testing.T) {
 			name: "Multiple running requests - should return minimum",
 			setupRequests: func(r *PredictedLatency, e fwksched.Endpoint) {
 				endpointName := types.NamespacedName{
-					Name:      e.GetMetadata().NamespacedName.Name,
-					Namespace: e.GetMetadata().NamespacedName.Namespace,
+					Name:      e.GetMetadata().ID.Name,
+					Namespace: e.GetMetadata().ID.Namespace,
 				}
 				queue := newRequestPriorityQueue()
 				queue.Add("req1", 0.05)
@@ -386,7 +412,7 @@ func TestPredictedLatencyFactory(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handle := igwtestutils.NewTestHandle(context.Background())
+			handle := testutils.NewTestHandle(context.Background())
 			rawParams := json.RawMessage(tt.jsonParams)
 			plugin, err := PredictedLatencyFactory(tt.pluginName, fwkplugin.StrictDecoder(rawParams), handle)
 
@@ -422,7 +448,7 @@ func TestPredictedLatencyFactoryInvalidJSON(t *testing.T) {
 
 	for _, tt := range invalidTests {
 		t.Run(tt.name, func(t *testing.T) {
-			handle := igwtestutils.NewTestHandle(context.Background())
+			handle := testutils.NewTestHandle(context.Background())
 			rawParams := json.RawMessage(tt.jsonParams)
 			plugin, err := PredictedLatencyFactory("test", fwkplugin.StrictDecoder(rawParams), handle)
 
@@ -447,7 +473,7 @@ func TestSloContextStoreEviction(t *testing.T) {
 	}
 
 	metadata := &fwkdl.EndpointMetadata{
-		NamespacedName: endpointName,
+		ID: endpointName,
 	}
 
 	sloCtx := newPredictedLatencyContext(req)
@@ -468,4 +494,113 @@ func TestSloContextStoreEviction(t *testing.T) {
 	item = pl.sloContextStore.Get(requestID)
 	assert.Nil(t, item, "Item should have been evicted from cache")
 	assert.False(t, queue.Contains(requestID), "Request should be removed from queue via OnEviction")
+}
+
+func dumpSeedQueue(ids map[string]float64) *requestPriorityQueue {
+	q := newRequestPriorityQueue()
+	for id, tpot := range ids {
+		q.Add(id, tpot)
+	}
+	return q
+}
+
+func dumpNN(name string) types.NamespacedName {
+	return types.NamespacedName{Name: name, Namespace: "default"}
+}
+
+func TestPredictedLatency_DumpState(t *testing.T) {
+	t.Parallel()
+
+	t.Run("populated sorted by running requests", func(t *testing.T) {
+		pl := &PredictedLatency{}
+		pl.runningRequestLists.Store(dumpNN("pod-a"), dumpSeedQueue(map[string]float64{"r1": 5, "r2": 5}))
+		pl.runningRequestLists.Store(dumpNN("pod-b"), dumpSeedQueue(map[string]float64{"r3": 9}))
+
+		payload, err := pl.DumpState()
+		require.NoError(t, err)
+		require.True(t, json.Valid(payload))
+
+		var state predictedLatencyState
+		require.NoError(t, json.Unmarshal(payload, &state))
+		require.Equal(t, predictedLatencyState{
+			Endpoints: []endpointPredictedLatencyState{
+				{Endpoint: dumpNN("pod-a").String(), RunningRequests: 2, MinTPOTSLO: 5},
+				{Endpoint: dumpNN("pod-b").String(), RunningRequests: 1, MinTPOTSLO: 9},
+			},
+			TotalEndpoints: 2,
+			MaxEndpoints:   maxDebugDumpEndpoints,
+		}, state)
+	})
+
+	t.Run("empty", func(t *testing.T) {
+		pl := &PredictedLatency{}
+		payload, err := pl.DumpState()
+		require.NoError(t, err)
+		var state predictedLatencyState
+		require.NoError(t, json.Unmarshal(payload, &state))
+		require.Empty(t, state.Endpoints)
+		require.Equal(t, 0, state.TotalEndpoints)
+		require.Equal(t, maxDebugDumpEndpoints, state.MaxEndpoints)
+		require.False(t, state.Truncated)
+		require.Equal(t, 0, state.TrackedRequests)
+	})
+
+	t.Run("caps endpoints", func(t *testing.T) {
+		pl := &PredictedLatency{}
+		for i := range maxDebugDumpEndpoints + 5 {
+			// pod-i gets i+1 running requests so the busiest sort deterministically.
+			seed := map[string]float64{}
+			for r := 0; r <= i; r++ {
+				seed[fmt.Sprintf("r%03d", r)] = 1
+			}
+			pl.runningRequestLists.Store(dumpNN(fmt.Sprintf("pod-%03d", i)), dumpSeedQueue(seed))
+		}
+		var state predictedLatencyState
+		payload, err := pl.DumpState()
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(payload, &state))
+		require.True(t, state.Truncated)
+		require.Equal(t, maxDebugDumpEndpoints+5, state.TotalEndpoints)
+		require.Len(t, state.Endpoints, maxDebugDumpEndpoints)
+		require.Equal(t, maxDebugDumpEndpoints+5, state.Endpoints[0].RunningRequests)
+	})
+
+	t.Run("tracked requests count", func(t *testing.T) {
+		pl := &PredictedLatency{}
+		pl.sloContextStore = ttlcache.New(ttlcache.WithTTL[string, *predictedLatencyCtx](time.Minute))
+		pl.sloContextStore.Set("req-1", &predictedLatencyCtx{}, ttlcache.DefaultTTL)
+		pl.sloContextStore.Set("req-2", &predictedLatencyCtx{}, ttlcache.DefaultTTL)
+
+		var state predictedLatencyState
+		payload, err := pl.DumpState()
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(payload, &state))
+		require.Equal(t, 2, state.TrackedRequests)
+		require.Empty(t, state.Endpoints)
+	})
+
+	// Non-finite head TPOT (NaN / +Inf) must not break json.Marshal; it is coerced to 0.
+	t.Run("non-finite min tpot sanitized", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			tpot float64
+		}{
+			{"nan", math.NaN()},
+			{"posinf", math.Inf(1)},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				pl := &PredictedLatency{}
+				pl.runningRequestLists.Store(dumpNN("pod-a"), dumpSeedQueue(map[string]float64{"r1": tc.tpot}))
+
+				payload, err := pl.DumpState()
+				require.NoError(t, err)
+				require.True(t, json.Valid(payload))
+				var state predictedLatencyState
+				require.NoError(t, json.Unmarshal(payload, &state))
+				require.Len(t, state.Endpoints, 1)
+				require.Equal(t, float64(0), state.Endpoints[0].MinTPOTSLO)
+				require.Equal(t, 1, state.Endpoints[0].RunningRequests)
+			})
+		}
+	})
 }

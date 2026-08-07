@@ -25,15 +25,16 @@ import (
 
 	v1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/common/request"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
-	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers"
 )
 
 const (
 	AnthropicParserType = "anthropic-parser"
 
-	messagesAPI = "messages"
+	messagesAPI    = "messages"
+	countTokensAPI = "messages/count_tokens"
 
 	streamingRespPrefix = "data: "
 
@@ -42,7 +43,10 @@ const (
 )
 
 // compile-time type validation
-var _ fwkrh.Parser = &AnthropicParser{}
+var (
+	_ fwkrh.Parser            = &AnthropicParser{}
+	_ fwkrh.ModelNameRewriter = &AnthropicParser{}
+)
 
 type AnthropicParser struct {
 	typedName fwkplugin.TypedName
@@ -63,7 +67,7 @@ func (p *AnthropicParser) TypedName() fwkplugin.TypedName {
 
 func (p *AnthropicParser) Claims() fwkrh.Claims {
 	return fwkrh.Claims{
-		Paths:     []string{messagesAPI},
+		Paths:     []string{messagesAPI, countTokensAPI},
 		Protocols: []v1.AppProtocol{v1.AppProtocolH2C, v1.AppProtocolHTTP},
 	}
 }
@@ -78,14 +82,24 @@ func (p *AnthropicParser) WithName(name string) *AnthropicParser {
 }
 
 func (p *AnthropicParser) ParseRequest(_ context.Context, body []byte, headers map[string]string) (*fwkrh.ParseResult, error) {
+	path := request.GetRequestPath(headers)
+
+	// The count_tokens endpoint returns only a token count and gains nothing from
+	// structured parsing or response interception; forward the body unchanged.
+	if strings.HasSuffix(path, "/"+countTokensAPI) {
+		return &fwkrh.ParseResult{
+			Body:                   &fwkrh.InferenceRequestBody{Payload: fwkrh.RawPayload(body)},
+			SkipResponseProcessing: true,
+		}, nil
+	}
+
+	if !strings.HasSuffix(path, "/"+messagesAPI) {
+		return nil, fmt.Errorf("unsupported API endpoint: %s", path)
+	}
+
 	bodyMap := make(map[string]any)
 	if err := json.Unmarshal(body, &bodyMap); err != nil {
 		return nil, fmt.Errorf("error unmarshaling request body: %w", err)
-	}
-
-	path := getRequestPath(headers)
-	if !strings.HasSuffix(path, "/"+messagesAPI) {
-		return nil, fmt.Errorf("unsupported API endpoint: %s", path)
 	}
 
 	var messagesReq fwkrh.MessagesRequest
@@ -97,14 +111,28 @@ func (p *AnthropicParser) ParseRequest(_ context.Context, body []byte, headers m
 	}
 
 	result := &fwkrh.InferenceRequestBody{
-		Messages: &messagesReq,
-		Payload:  fwkrh.PayloadMap(bodyMap),
+		Messages:        &messagesReq,
+		Payload:         fwkrh.PayloadMap(bodyMap),
+		MaxOutputTokens: fwkrh.MaxOutputTokensFromPayload(bodyMap, "max_tokens"),
+	}
+	if model, ok := bodyMap["model"].(string); ok {
+		result.Model = model
 	}
 	if stream, ok := bodyMap["stream"].(bool); ok && stream {
 		result.Stream = true
 	}
 
 	return &fwkrh.ParseResult{Body: result, SkipResponseProcessing: false}, nil
+}
+
+// RewriteModelName writes the resolved model into the request payload map.
+func (p *AnthropicParser) RewriteModelName(payload fwkrh.MarshalablePayload, model string) (fwkrh.MarshalablePayload, error) {
+	m, ok := payload.(fwkrh.PayloadMap)
+	if !ok {
+		return payload, nil
+	}
+	m["model"] = model
+	return m, nil
 }
 
 func (p *AnthropicParser) ParseResponse(_ context.Context, body []byte, headers map[string]string, _ bool) (*fwkrh.ParsedResponse, error) {
@@ -128,19 +156,6 @@ func (p *AnthropicParser) ParseResponse(_ context.Context, body []byte, headers 
 		return nil, err
 	}
 	return &fwkrh.ParsedResponse{Usage: usage}, nil
-}
-
-func getRequestPath(headers map[string]string) string {
-	if path := headers[parsers.MethodPathKey]; path != "" {
-		return path
-	}
-	if path := headers["x-original-path"]; path != "" {
-		return path
-	}
-	if path := headers["x-forwarded-path"]; path != "" {
-		return path
-	}
-	return ""
 }
 
 func extractUsage(responseBytes []byte) (*fwkrh.Usage, error) {

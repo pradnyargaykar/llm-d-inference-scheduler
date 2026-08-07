@@ -142,7 +142,7 @@ func (p *ContextLengthAware) Filter(ctx context.Context, request *scheduling.Inf
 
 		r, err := parseContextRange(rangeStr)
 		if err != nil {
-			logger.Error(err, "Failed to parse context range label", "endpoint", metadata.NamespacedName, "rangeStr", rangeStr)
+			logger.Error(err, "Failed to parse context range label", "endpoint", metadata.ID, "rangeStr", rangeStr)
 			continue
 		}
 
@@ -181,7 +181,7 @@ func (p *ContextLengthAware) Score(ctx context.Context, request *scheduling.Infe
 
 		r, err := parseContextRange(rangeStr)
 		if err != nil {
-			logger.Error(err, "Failed to parse context range label", "endpoint", metadata.NamespacedName, "rangeStr", rangeStr)
+			logger.Error(err, "Failed to parse context range label", "endpoint", metadata.ID, "rangeStr", rangeStr)
 			scoredEndpoints[endpoint] = 0.0
 			continue
 		}
@@ -206,7 +206,7 @@ func getContextLength(request *scheduling.InferenceRequest) int {
 	if request == nil || request.Body == nil || request.Body.TokenizedPrompt == nil {
 		return 0
 	}
-	return len(request.Body.TokenizedPrompt.TokenIDs)
+	return request.Body.TokenizedPrompt.TokenCount()
 }
 
 // parseContextRange parses a label value into a single context range.

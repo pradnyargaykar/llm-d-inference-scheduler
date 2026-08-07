@@ -26,8 +26,9 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
+	logging "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
-	"github.com/llm-d/llm-d-router/pkg/telemetry"
 )
 
 // contextKey is a custom type for context keys to avoid collisions
@@ -44,6 +45,12 @@ const (
 
 	// ResponsesPath is the OpenAI Responses API path
 	ResponsesPath = "/v1/responses"
+
+	// MessagesPath is the Anthropic Messages API path
+	MessagesPath = "/v1/messages"
+
+	// GeneratePath is vLLM's token-in generate endpoint
+	GeneratePath = "/inference/v1/generate"
 )
 
 func openAIAPIAttr(apiType APIType) attribute.KeyValue {
@@ -55,8 +62,8 @@ func openAIAPIAttr(apiType APIType) attribute.KeyValue {
 func (s *Server) disaggregatedPrefillHandler(apiType APIType) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		requestStart := time.Now()
-		tracer := telemetry.Tracer()
-		ctx, span := tracer.Start(r.Context(), "llm_d.pd_proxy.request",
+		tracer := tracing.Tracer(tracerScope)
+		ctx, span := tracer.Start(r.Context(), "forward_request",
 			trace.WithSpanKind(trace.SpanKindServer),
 		)
 		defer span.End()
@@ -125,6 +132,27 @@ func (s *Server) disaggregatedPrefillHandler(apiType APIType) http.HandlerFunc {
 			s.logger.V(4).Info("SSRF protection: prefill target allowed", "target", prefillHostPort)
 		}
 
+		kvCacheSource := strings.TrimSpace(r.Header.Get(routing.KVCacheSourceHeader))
+		r.Header.Del(routing.KVCacheSourceHeader)
+		if kvCacheSource != "" {
+			switch {
+			case !s.p2pPullAvailable():
+				s.logger.V(logging.DEBUG).Info("ignoring KV cache source header: connector does not support P2P pulls",
+					"connector", s.config.KVConnector)
+				kvCacheSource = ""
+			case !isHostPort(kvCacheSource):
+				s.logger.Info("ignoring malformed KV cache source header", "value", kvCacheSource)
+				kvCacheSource = ""
+			case !s.allowlistValidator.IsAllowed(kvCacheSource):
+				s.logger.Info("SSRF protection: KV cache source not in allowlist, ignoring",
+					"target", kvCacheSource, "clientIP", r.RemoteAddr)
+				kvCacheSource = ""
+			}
+		}
+		if kvCacheSource != "" {
+			span.SetAttributes(attribute.String("llm_d.pd_proxy.kv_cache_source", kvCacheSource))
+		}
+
 		encoderHostPorts := r.Header.Values(routing.EncoderEndpointsHeader)
 		r.Header.Del(routing.EncoderEndpointsHeader)
 		if len(encoderHostPorts) == 1 {
@@ -149,37 +177,41 @@ func (s *Server) disaggregatedPrefillHandler(apiType APIType) http.HandlerFunc {
 			}
 		}
 
-		if len(allowedEncoders) > 0 && s.handleEPDConnector != nil {
-			s.logger.V(4).Info("encoder headers detected, using EPD protocol",
+		if len(allowedEncoders) > 0 && s.handleECConnector != nil {
+			s.logger.V(4).Info("encoder headers detected, using EC connector",
 				"encoderCount", len(allowedEncoders),
 				"encoderCandidates", len(encoderHostPorts),
 				"hasPrefiller", len(prefillHostPort) > 0)
 			span.SetAttributes(
-				attribute.Bool("llm_d.epd_proxy.encode_disaggregation_used", true),
-				attribute.Int("llm_d.epd_proxy.encoder_count", len(allowedEncoders)),
-				attribute.Int("llm_d.epd_proxy.encoder_candidates", len(encoderHostPorts)),
+				attribute.Bool("llm_d.ec_proxy.encode_disaggregation_used", true),
+				attribute.Int("llm_d.ec_proxy.encoder_count", len(allowedEncoders)),
+				attribute.Int("llm_d.ec_proxy.encoder_candidates", len(encoderHostPorts)),
 			)
-			s.handleEPDConnector(w, r, prefillHostPort, allowedEncoders)
+			s.handleECConnector(w, r, prefillHostPort, allowedEncoders)
 			return
 		}
 
 		if len(encoderHostPorts) > 0 && len(allowedEncoders) == 0 {
 			s.logger.Info("SSRF protection: all encoder targets filtered out, falling back to P/D or decoder-only")
 			span.SetAttributes(
-				attribute.Bool("llm_d.epd_proxy.encode_disaggregation_used", false),
-				attribute.Int("llm_d.epd_proxy.encoder_allowed", len(allowedEncoders)),
-				attribute.Int("llm_d.epd_proxy.encoder_candidates", len(encoderHostPorts)),
+				attribute.Bool("llm_d.ec_proxy.encode_disaggregation_used", false),
+				attribute.Int("llm_d.ec_proxy.encoder_allowed", len(allowedEncoders)),
+				attribute.Int("llm_d.ec_proxy.encoder_candidates", len(encoderHostPorts)),
 			)
 		}
 
 		if len(prefillHostPort) > 0 {
 			s.logger.V(4).Info("using P/D protocol")
-			s.handlePDConnector(w, r, prefillHostPort, apiType)
+			s.handlePDConnector(w, r, prefillHostPort, kvCacheSource, apiType)
 			return
 		}
 
 		s.logger.V(4).Info("no prefiller or encoder, using decoder only")
 		if !s.forwardDataParallel || !s.dataParallelHandler(w, r) {
+			if kvCacheSource != "" {
+				s.decodeWithP2PSource(w, r, kvCacheSource)
+				return
+			}
 			if s.config.DecodeChunkSize > 0 && r.URL.Path == ChatCompletionsPath {
 				s.runChunkedDecode(w, r)
 				return

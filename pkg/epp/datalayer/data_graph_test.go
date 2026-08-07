@@ -32,14 +32,16 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/util"
 )
 
 const mockProducedDataKey = "mockProducedData"
 
 type mockDataProducerP struct {
-	name     string
-	produces map[fwkplugin.DataKey]any
-	consumes map[fwkplugin.DataKey]any
+	name       string
+	pluginType string
+	produces   map[fwkplugin.DataKey]any
+	consumes   map[fwkplugin.DataKey]any
 }
 
 type mockProducedDataType struct {
@@ -51,7 +53,11 @@ func (m *mockProducedDataType) Clone() fwkdl.Cloneable {
 }
 
 func (m *mockDataProducerP) TypedName() fwkplugin.TypedName {
-	return fwkplugin.TypedName{Name: m.name, Type: "mock"}
+	t := m.pluginType
+	if t == "" {
+		t = "mock"
+	}
+	return fwkplugin.TypedName{Name: m.name, Type: t}
 }
 
 func (m *mockDataProducerP) Produces() map[fwkplugin.DataKey]any {
@@ -264,7 +270,7 @@ func TestDAGAndTopologicalOrder(t *testing.T) {
 				}
 				assert.NoError(t, err)
 			}
-			orderedPlugins, err := topologicalSort(dag)
+			orderedPlugins, err := util.TopologicalSort(dag)
 
 			if tc.expectedErr != "" {
 				assert.Error(t, err)
@@ -582,4 +588,30 @@ func assertTopologicalOrder(t *testing.T, dag map[string][]string, ordered []str
 			assert.Less(t, positions[dep], positions[node], "Dependency %s should come before %s", dep, node)
 		}
 	}
+}
+
+func TestCreateMissingDataProducers_AlphaStabilityBlocked(t *testing.T) {
+	alphaProducerType := "alpha-producer-type"
+	fwkplugin.Register(alphaProducerType, fwkplugin.StabilityAlpha, func(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
+		return &mockDataProducerP{name: name, pluginType: alphaProducerType, produces: map[fwkplugin.DataKey]any{fwkplugin.NewDataKey("alphaKey", alphaProducerType): nil}}, nil
+	})
+
+	keyAlpha := fwkplugin.NewDataKey("alphaKey", alphaProducerType)
+	handle := fwkplugin.NewEppHandle(context.Background(), func() []k8stypes.NamespacedName { return nil })
+	handle.AddPlugin("consumer", &MockSchedulingPlugin{consumes: map[fwkplugin.DataKey]any{keyAlpha: nil}})
+
+	err := CreateMissingDataProducers(context.Background(),
+		map[string]string{keyAlpha.String(): alphaProducerType},
+		fwkplugin.Registry,
+		handle)
+	assert.NoError(t, err)
+
+	// 1. Without allowExperimentalPlugins -> should fail validation
+	err = fwkplugin.ValidatePluginStability(handle, false)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "has Alpha stability level, but command line flag --allow-experimental-plugins is not set")
+
+	// 2. With allowExperimentalPlugins -> should succeed
+	err = fwkplugin.ValidatePluginStability(handle, true)
+	assert.NoError(t, err)
 }

@@ -213,6 +213,20 @@ func (m *mockRegistryClient) Stats() contracts.AggregateStats {
 	return contracts.AggregateStats{}
 }
 
+func (m *mockRegistryClient) SubmitDesiredPriorities(_ map[int]struct{}) {}
+
+func (m *mockRegistryClient) PriorityBandUpdateChannel() <-chan map[int]struct{} {
+	return nil
+}
+
+func (m *mockRegistryClient) FlowGCTimeout() time.Duration {
+	return time.Minute
+}
+
+func (m *mockRegistryClient) ApplyDesiredPriorities(_ map[int]struct{}) {}
+
+func (m *mockRegistryClient) ExecuteGCCycle() {}
+
 // mockProcessor is a mock for the internal `Processor` interface.
 type mockProcessor struct {
 	SubmitFunc        func(item *internal.FlowItem) error
@@ -265,6 +279,7 @@ type mockProcessorFactory struct {
 func (f *mockProcessorFactory) new(
 	_ context.Context, // The factory does not use the lifecycle context; it's passed to the processor's Run method later.
 	_ contracts.FlowRegistry,
+	_ contracts.FlowRegistryBackground,
 	_ flowcontrol.SaturationDetector,
 	_ contracts.EndpointCandidates,
 	_ flowcontrol.UsageLimitPolicy,
@@ -352,6 +367,71 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 			assert.Equal(t, types.QueueOutcomeRejectedOther, outcome,
 				"outcome should be QueueOutcomeRejectedOther on shutdown")
 		})
+		t.Run("OnControllerShutdownDuringFinalization", func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(t.Context())
+			h := newUnitHarness(ctx, t, &Config{}, nil, nil)
+			item := internal.NewItem(newTestRequest(defaultFlowKey), 0, time.Now())
+
+			result := make(chan struct {
+				outcome types.QueueOutcome
+				err     error
+			}, 1)
+			go func() {
+				outcome, err := h.fc.awaitFinalization(context.Background(), item)
+				result <- struct {
+					outcome types.QueueOutcome
+					err     error
+				}{outcome: outcome, err: err}
+			}()
+
+			cancel()
+			select {
+			case r := <-result:
+				require.Error(t, r.err, "awaitFinalization must fail when controller shuts down")
+				assert.ErrorIs(t, r.err, types.ErrFlowControllerNotRunning,
+					"error should wrap ErrFlowControllerNotRunning")
+				assert.Equal(t, types.QueueOutcomeRejectedOther, r.outcome,
+					"outcome should be QueueOutcomeRejectedOther on shutdown")
+			case <-time.After(time.Second):
+				t.Fatal("awaitFinalization did not return after controller shutdown")
+			}
+		})
+		t.Run("OnControllerShutdownTakesPrecedenceOverRequestCancellation", func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(t.Context())
+			h := newUnitHarness(ctx, t, &Config{}, nil, nil)
+			reqCtx, reqCancel := context.WithCancel(context.Background())
+			item := internal.NewItem(newTestRequest(defaultFlowKey), 0, time.Now())
+
+			reqCancel()
+			cancel()
+
+			outcome, err := h.fc.awaitFinalization(reqCtx, item)
+			require.Error(t, err, "awaitFinalization must fail when controller shuts down")
+			assert.ErrorIs(t, err, types.ErrFlowControllerNotRunning,
+				"controller shutdown should take precedence over request cancellation")
+			assert.Equal(t, types.QueueOutcomeRejectedOther, outcome,
+				"shutdown should return the rejected outcome")
+		})
+		t.Run("OnControllerShutdownPreservesQueuedOutcome", func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(t.Context())
+			h := newUnitHarness(ctx, t, &Config{}, nil, nil)
+			item := internal.NewItem(newTestRequest(defaultFlowKey), 0, time.Now())
+			item.SetHandle(&fwkfcmocks.MockQueueItemHandle{})
+
+			cancel()
+
+			outcome, err := h.fc.awaitFinalization(context.Background(), item)
+			require.Error(t, err, "awaitFinalization must fail when controller shuts down")
+			assert.ErrorIs(t, err, types.ErrEvicted,
+				"a queued item should be evicted, not rejected, during shutdown")
+			assert.ErrorIs(t, err, types.ErrFlowControllerNotRunning,
+				"queued shutdown should preserve the shutdown cause")
+			assert.Equal(t, types.QueueOutcomeEvictedOther, outcome,
+				"a queued item should return the evicted outcome")
+		})
 
 		t.Run("OnRegistryConnectionError", func(t *testing.T) {
 			t.Parallel()
@@ -382,16 +462,21 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 			h := newUnitHarness(t.Context(), t, &Config{}, mockRegistry, nil)
 
 			// Create a faulty setup that successfully leases the flow but fails to return the
-			// ManagedQueue. This setup should be considered as unavailable.
+			// ManagedQueue. The error wraps ErrPriorityBandNotFound (the realistic registry failure) to
+			// prove the sentinel does not leak into the finalized error, where
+			// withConnectionWithFallback would misread it as a lease-acquisition failure and retry at
+			// priority 0.
 			faultyRegistry := &mocks.MockRegistryDataPlane{
 				ManagedQueueFunc: func(_ flowcontrol.FlowKey) (contracts.ManagedQueue, error) {
-					return nil, errors.New("invariant violation: queue retrieval failed")
+					return nil, fmt.Errorf("invariant violation: %w", contracts.ErrPriorityBandNotFound)
 				},
 			}
+			var connectionAttempts int
 			mockRegistry.WithConnectionFunc = func(
 				key flowcontrol.FlowKey,
 				fn func(conn contracts.ActiveFlowConnection) error,
 			) error {
+				connectionAttempts++
 				return fn(&mockActiveFlowConnection{
 					RegistryV: faultyRegistry,
 					FlowKeyV:  key,
@@ -402,8 +487,12 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 			outcome, err := h.fc.EnqueueAndWait(context.Background(), req)
 			require.Error(t, err, "EnqueueAndWait must reject requests if queue doesn't exist for flow")
 			assert.ErrorIs(t, err, types.ErrRejected, "error should wrap ErrRejected")
-			assert.Equal(t, types.QueueOutcomeRejectedCapacity, outcome,
-				"outcome should be QueueOutcomeRejectedCapacity when queue doesn't exist for the flow")
+			assert.NotErrorIs(t, err, contracts.ErrPriorityBandNotFound,
+				"registry sentinels must not leak into the finalized error")
+			assert.Equal(t, types.QueueOutcomeRejectedOther, outcome,
+				"outcome should be QueueOutcomeRejectedOther when queue doesn't exist for the flow")
+			assert.Equal(t, 1, connectionAttempts,
+				"an invariant violation on a leased flow must not trigger the priority-0 fallback retry")
 		})
 	})
 
@@ -1054,4 +1143,45 @@ func TestFlowController_Concurrency_Backpressure(t *testing.T) {
 	}
 	require.Equal(t, numRequests, successCount,
 		"all concurrent requests should be dispatched successfully even under high contention and zero buffer capacity")
+}
+
+// TestFlowController_EnqueueAndWait_FallbackRewritesItemPriority verifies that when the requested priority band is not
+// provisioned, the request is not only leased at the fallback priority (0) but also enqueued there: the FlowItem handed
+// to the processor must report the fallback flow key, not the original (unprovisioned) priority. Without this, the
+// processor looks up a managed queue at the missing band and rejects the request.
+func TestFlowController_EnqueueAndWait_FallbackRewritesItemPriority(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const originalPriority = 100
+
+	var capturedKey flowcontrol.FlowKey
+	processor := &mockProcessor{
+		SubmitFunc: func(item *internal.FlowItem) error {
+			capturedKey = item.OriginalRequest().FlowKey()
+			go item.FinalizeWithOutcome(types.QueueOutcomeDispatched, nil)
+			return nil
+		},
+	}
+
+	registry := &mockRegistryClient{FlowRegistryDataPlane: &mocks.MockRegistryDataPlane{}}
+	registry.WithConnectionFunc = func(key flowcontrol.FlowKey, fn func(conn contracts.ActiveFlowConnection) error) error {
+		// Only priority 0 is provisioned; any other band is rejected, forcing the fallback.
+		if key.Priority != 0 {
+			return fmt.Errorf("band %d: %w", key.Priority, contracts.ErrPriorityBandNotFound)
+		}
+		return fn(&mockActiveFlowConnection{RegistryV: registry, FlowKeyV: key})
+	}
+
+	h := newUnitHarness(ctx, t, &Config{DefaultRequestTTL: time.Minute}, registry, processor)
+
+	outcome, err := h.fc.EnqueueAndWait(ctx, newTestRequest(flowcontrol.FlowKey{ID: "batch", Priority: originalPriority}))
+
+	require.NoError(t, err, "fallback request should be dispatched, not rejected")
+	assert.Equal(t, types.QueueOutcomeDispatched, outcome)
+	assert.Equal(t, 0, capturedKey.Priority,
+		"fallback request must be enqueued at priority 0, not its original unprovisioned priority")
+	assert.Equal(t, "batch", capturedKey.ID, "fallback must preserve the flow ID")
 }

@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -32,7 +33,6 @@ import (
 	configapi "github.com/llm-d/llm-d-router/apix/config/v1alpha1"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-router/pkg/epp/config"
-	"github.com/llm-d/llm-d-router/pkg/epp/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/registry"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
@@ -55,18 +55,22 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/kvcacheutilization"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/prefix"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/queuedepth"
-	igwtestutils "github.com/llm-d/llm-d-router/test/utils/igw"
+	testutils "github.com/llm-d/llm-d-router/test/utils"
 )
 
 // Define constants for test plugins.
 // Constants must match those used in testdata_test.go.
 const (
-	testPluginType     = "test-plugin"
-	testPickerType     = "test-picker"
-	testScorerType     = "test-scorer"
-	testProfileHandler = "test-profile-handler"
-	testSourceType     = "test-source"
-	testExtractorType  = "test-extractor"
+	testPluginType             = "test-plugin"
+	testPickerType             = "test-picker"
+	testScorerType             = "test-scorer"
+	testProfileHandler         = "test-profile-handler"
+	testSourceType             = "test-source"
+	testExtractorType          = "test-extractor"
+	testWithDependencies       = "test-with-dependencies"
+	testWithNestedDependencies = "test-with-nested-dependencies"
+
+	testFeatureGate = "test-feature-gate"
 )
 
 // --- Test: Phase 1 (Raw Loading & Static Defaults) ---
@@ -75,19 +79,20 @@ func TestLoadRawConfiguration(t *testing.T) {
 	t.Parallel()
 
 	// Register known feature gates for validation.
-	RegisterFeatureGate(datalayer.ExperimentalDatalayerFeatureGate)
-	RegisterFeatureGate(flowcontrol.FeatureGate)
+	RegisterFeatureGate(testFeatureGate, true)
+	RegisterFeatureGate(flowcontrol.FeatureGate, false)
 
 	queueScorerWeight := 2.0
 	kvCacheUtilizationScorerWeight := 2.0
 	prefixCacheScorerWeight := 3.0
 
 	tests := []struct {
-		name       string
-		configText string
-		want       *configapi.EndpointPickerConfig
-		wantErr    bool
-		deprecated bool
+		name         string
+		configText   string
+		want         *configapi.EndpointPickerConfig
+		wantFeatures map[string]bool
+		wantErr      bool
+		deprecated   bool
 	}{
 		{
 			name:       "Success - Full Configuration",
@@ -114,7 +119,7 @@ func TestLoadRawConfiguration(t *testing.T) {
 					},
 				},
 				FeatureGates: configapi.FeatureGates{
-					datalayer.ExperimentalDatalayerFeatureGate,
+					testFeatureGate,
 					flowcontrol.FeatureGate,
 				},
 				FlowControl: &configapi.FlowControlConfig{
@@ -122,6 +127,10 @@ func TestLoadRawConfiguration(t *testing.T) {
 						PluginRef: "utilization-detector",
 					},
 				},
+			},
+			wantFeatures: map[string]bool{
+				testFeatureGate:         true,
+				flowcontrol.FeatureGate: true,
 			},
 			wantErr:    false,
 			deprecated: false,
@@ -151,7 +160,7 @@ func TestLoadRawConfiguration(t *testing.T) {
 					},
 				},
 				FeatureGates: configapi.FeatureGates{
-					datalayer.ExperimentalDatalayerFeatureGate,
+					testFeatureGate,
 					flowcontrol.FeatureGate,
 				},
 				FlowControl: &configapi.FlowControlConfig{
@@ -174,7 +183,13 @@ func TestLoadRawConfiguration(t *testing.T) {
 				Plugins: []configapi.PluginSpec{
 					{Name: "test1", Type: testPluginType, Parameters: json.RawMessage(`{"threshold":10}`)},
 				},
-				FeatureGates: configapi.FeatureGates{},
+				FeatureGates: configapi.FeatureGates{
+					testFeatureGate + "=false",
+				},
+			},
+			wantFeatures: map[string]bool{
+				testFeatureGate:         false,
+				flowcontrol.FeatureGate: false,
 			},
 			wantErr:    false,
 			deprecated: false,
@@ -239,6 +254,10 @@ func TestLoadRawConfiguration(t *testing.T) {
 						},
 					},
 				},
+			},
+			wantFeatures: map[string]bool{
+				testFeatureGate:         true,
+				flowcontrol.FeatureGate: false,
 			},
 			wantErr:    false,
 			deprecated: false,
@@ -322,6 +341,12 @@ func TestLoadRawConfiguration(t *testing.T) {
 			wantErr:    true,
 			deprecated: false,
 		},
+		{
+			name:       "Error - Bad Feature Gate",
+			configText: errorBadFeatureGateText,
+			wantErr:    true,
+			deprecated: false,
+		},
 	}
 
 	for _, tc := range tests {
@@ -330,7 +355,7 @@ func TestLoadRawConfiguration(t *testing.T) {
 			writer := &strings.Builder{}
 			logger := logging.NewTestLoggerWithWriter(writer)
 
-			got, _, err := LoadRawConfig([]byte(tc.configText), logger)
+			got, featureGates, err := LoadRawConfig([]byte(tc.configText), logger)
 
 			if tc.wantErr {
 				require.Error(t, err, "Expected LoadRawConfig to fail")
@@ -339,6 +364,11 @@ func TestLoadRawConfiguration(t *testing.T) {
 			require.NoError(t, err, "Expected LoadRawConfig to succeed")
 			diff := cmp.Diff(tc.want, got)
 			require.Empty(t, diff, "Config mismatch (-want +got):\n%s", diff)
+
+			if tc.wantFeatures != nil {
+				diff = cmp.Diff(tc.wantFeatures, featureGates)
+				require.Empty(t, diff, "Config feature gates mismatch (-want +got):\n%s", diff)
+			}
 
 			if strings.Contains(writer.String(), "deprecated") {
 				require.True(t, tc.deprecated, "Deprecated configuration wasn't marked as deprecated")
@@ -351,12 +381,70 @@ func TestLoadRawConfiguration(t *testing.T) {
 
 // --- Test: Phase 2 (Instantiation, System Defaulting, Deep Validation) ---
 
+func TestPluginsWithDependencies(t *testing.T) {
+	// Not parallel because it modifies global plugin registry.
+	registerTestPlugins(t)
+
+	tests := []struct {
+		name       string
+		configText string
+		wantErr    bool
+	}{
+		{
+			name:       "pluginsInOrder",
+			configText: pluginsInOrderText,
+		},
+		{
+			name:       "pluginsOutOfOrder",
+			configText: pluginsOutOfOrderText,
+		},
+		{
+			name:       "pluginsRefedByPointer",
+			configText: pluginsRefedByPointerText,
+		},
+		{
+			name:       "pluginsRefedInNesteding",
+			configText: pluginsRefedInNestedingText,
+		},
+		{
+			name:       "errorPluginsRefedInLoop",
+			configText: errorPluginsRefedInLoopText,
+			wantErr:    true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := logging.NewTestLogger()
+
+			// 1. Load Raw (Assuming valid yaml/structure for Phase 2 tests)
+			rawConfig, _, err := LoadRawConfig([]byte(tc.configText), logger)
+			if err != nil {
+				// If we expected failure (and it failed early in Phase 1), success.
+				if tc.wantErr {
+					return
+				}
+				require.NoError(t, err, "Setup: LoadRawConfig failed")
+			}
+
+			// 2. Instantiate
+			handle := testutils.NewTestHandle(context.Background())
+			err = instantiatePlugins(rawConfig.Plugins, handle, logger)
+			if tc.wantErr {
+				require.Error(t, err, "Expected instantiatePlugins to fail")
+				return
+			}
+			require.NoError(t, err, "Expected instantiatePlugins to succeed")
+		})
+	}
+}
+
 func TestInstantiateAndConfigure(t *testing.T) {
 	// Not parallel because it modifies global plugin registry.
 	registerTestPlugins(t)
 
-	RegisterFeatureGate(datalayer.ExperimentalDatalayerFeatureGate)
-	RegisterFeatureGate(flowcontrol.FeatureGate)
+	RegisterFeatureGate(testFeatureGate, true)
+	RegisterFeatureGate(flowcontrol.FeatureGate, false)
 
 	tests := []struct {
 		name       string
@@ -473,7 +561,7 @@ func TestInstantiateAndConfigure(t *testing.T) {
 			},
 		},
 		{
-			name:       "Ignored - Flow Control Config Present but FeatureGate Missing",
+			name:       "Ignored - Flow Control Config Present but FeatureGate Disabled",
 			configText: successflowControlConfigDisabledText,
 			wantErr:    false,
 			validate: func(t *testing.T, handle fwkplugin.Handle, rawCfg *configapi.EndpointPickerConfig, cfg *config.Config) {
@@ -746,7 +834,7 @@ func TestInstantiateAndConfigure(t *testing.T) {
 			}
 
 			// 2. Instantiate & Configure
-			handle := igwtestutils.NewTestHandle(context.Background())
+			handle := testutils.NewTestHandle(context.Background())
 			cfg, err := InstantiateAndConfigure(rawConfig, handle, logger)
 
 			if tc.wantErr {
@@ -762,11 +850,81 @@ func TestInstantiateAndConfigure(t *testing.T) {
 	}
 }
 
+// TestFlowControlConfigIgnoredWarning verifies that a flowControl config section combined with a
+// disabled flowControl feature gate logs a warning that the settings are ignored, and that the
+// warning stays silent otherwise. The silent cases carry the weight here: ensureSaturationDetector
+// populates FlowControl for every config, so a predicate that ignored its saturationDetector
+// exclusion would warn at every legacy-path startup.
+func TestFlowControlConfigIgnoredWarning(t *testing.T) {
+	// Not parallel because it modifies the global plugin registry.
+	registerTestPlugins(t)
+	RegisterFeatureGate(flowcontrol.FeatureGate, false)
+
+	testCases := []struct {
+		name        string
+		configText  string
+		gateEnabled bool
+		wantWarn    bool
+	}{
+		{
+			name:       "settings ignored under an explicit opt-out",
+			configText: successflowControlConfigDisabledText,
+			wantWarn:   true,
+		},
+		{
+			name:       "settings ignored under the disabled default",
+			configText: successFlowControlConfigNoGatesText,
+			wantWarn:   true,
+		},
+		{
+			name:       "opt-out with no flowControl section",
+			configText: successFlowControlDisabledNoSectionText,
+		},
+		{
+			name:       "opt-out with only a saturation detector",
+			configText: successFlowControlDisabledSaturationDetectorText,
+		},
+		{
+			name:        "settings honored when the gate is on",
+			configText:  successFlowControlConfigText,
+			gateEnabled: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			writer := &strings.Builder{}
+			logger := logging.NewTestLoggerWithWriter(writer)
+
+			rawConfig, _, err := LoadRawConfig([]byte(tc.configText), logger)
+			require.NoError(t, err)
+
+			handle := testutils.NewTestHandle(context.Background())
+			cfg, err := InstantiateAndConfigure(rawConfig, handle, logger)
+			require.NoError(t, err)
+
+			if tc.gateEnabled {
+				require.NotNil(t, cfg.FlowControlConfig, "flow control config should be built when the gate is on")
+			} else {
+				require.Nil(t, cfg.FlowControlConfig, "flow control config should not be built when the gate is disabled")
+			}
+
+			if tc.wantWarn {
+				require.Contains(t, writer.String(), "flowControl feature gate is disabled",
+					"the ignored flowControl section should be called out in the logs")
+			} else {
+				require.NotContains(t, writer.String(), "flowControl feature gate is disabled",
+					"nothing is being ignored, so the warning should stay silent")
+			}
+		})
+	}
+}
+
 // TestBuildDataLayerConfigEmptySourcesWarning verifies that an empty sources list
 // logs a warning but does not return an error.
 func TestBuildDataLayerConfigEmptySourcesWarning(t *testing.T) {
 	t.Parallel()
-	handle := igwtestutils.NewTestHandle(context.Background())
+	handle := testutils.NewTestHandle(context.Background())
 	cfg, err := buildDataLayerConfig(
 		&configapi.DataLayerConfig{Sources: []configapi.DataLayerSource{}},
 		handle,
@@ -860,12 +1018,67 @@ func (m *mockExtractor) Extract(_ context.Context, _ fwkdl.NotificationEvent) er
 	return nil
 }
 
+// mockWithDependencies is a ProfileHandler that "uses" other plugins
+type mockWithDependencies struct{ mockPlugin }
+type mockWithDependenciesConfig struct {
+	Dependency string  `json:"dependency" pluginRef:""`
+	PointedTo  *string `json:"pointedTo" pluginRef:""`
+}
+
+// compile-time type assertion
+var _ fwksched.ProfileHandler = &mockWithDependencies{}
+
+func (m *mockWithDependencies) Pick(context.Context, *fwksched.InferenceRequest, map[string]fwksched.SchedulerProfile,
+	map[string]*fwksched.ProfileRunResult) map[string]fwksched.SchedulerProfile {
+	return nil
+}
+func (m *mockWithDependencies) ProcessResults(context.Context, *fwksched.InferenceRequest,
+	map[string]*fwksched.ProfileRunResult) (*fwksched.SchedulingResult, error) {
+	return nil, errors.New("sentinel error for mock handler")
+}
+
+func mockWithDependenciesConfigParser(decoder *json.Decoder, _ fwkplugin.Handle) (any, error) {
+	cfg := &mockWithDependenciesConfig{}
+	err := decoder.Decode(cfg)
+	return cfg, err
+}
+
+// mockWithNestedDependencies is a ProfileHandler that "uses" other plugins
+type mockWithNestedDependencies struct{ mockPlugin }
+type mockWithNestedDependenciesConfig struct {
+	Nested    MockNestedDependenciesStruct  `json:"nested"`
+	NestedPtr *MockNestedDependenciesStruct `json:"nestedPtr"`
+	Extras    []string                      `json:"extras" pluginRef:""`
+	PointedTo *string                       `json:"pointedTo" pluginRef:""`
+}
+type MockNestedDependenciesStruct struct {
+	Dependency string `json:"dependency" pluginRef:""`
+}
+
+// compile-time type assertion
+var _ fwksched.ProfileHandler = &mockWithDependencies{}
+
+func (m *mockWithNestedDependencies) Pick(context.Context, *fwksched.InferenceRequest, map[string]fwksched.SchedulerProfile,
+	map[string]*fwksched.ProfileRunResult) map[string]fwksched.SchedulerProfile {
+	return nil
+}
+func (m *mockWithNestedDependencies) ProcessResults(context.Context, *fwksched.InferenceRequest,
+	map[string]*fwksched.ProfileRunResult) (*fwksched.SchedulingResult, error) {
+	return nil, errors.New("sentinel error for mock handler")
+}
+
+func mockWithNestedDependenciesConfigParser(decoder *json.Decoder, _ fwkplugin.Handle) (any, error) {
+	cfg := &mockWithNestedDependenciesConfig{}
+	err := decoder.Decode(cfg)
+	return cfg, err
+}
+
 func registerTestPlugins(t *testing.T) {
 	t.Helper()
 
 	// Helper to generate simple factories.
 	register := func(name string, factory fwkplugin.FactoryFunc) {
-		fwkplugin.Register(name, factory)
+		fwkplugin.Register(name, fwkplugin.StabilityStable, factory)
 	}
 
 	mockFactory := func(tType string) fwkplugin.FactoryFunc {
@@ -877,7 +1090,7 @@ func registerTestPlugins(t *testing.T) {
 	// Register standard test mocks.
 	register(testPluginType, mockFactory(testPluginType))
 
-	fwkplugin.Register(testScorerType, func(name string, params *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
+	fwkplugin.Register(testScorerType, fwkplugin.StabilityStable, func(name string, params *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
 		// Attempt to unmarshal to trigger errors for invalid JSON in tests.
 		if params != nil {
 			var p struct {
@@ -890,50 +1103,98 @@ func registerTestPlugins(t *testing.T) {
 		return &mockScorer{mockPlugin{t: fwkplugin.TypedName{Name: name, Type: testScorerType}}}, nil
 	})
 
-	fwkplugin.Register("utilization-detector", func(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
+	fwkplugin.Register("utilization-detector", fwkplugin.StabilityStable, func(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
 		return &mockSaturationDetector{mockPlugin{t: fwkplugin.TypedName{Name: name, Type: "utilization-detector"}}}, nil
 	})
 
-	fwkplugin.Register(testPickerType, func(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
+	fwkplugin.Register(testPickerType, fwkplugin.StabilityStable, func(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
 		return &mockPicker{mockPlugin{t: fwkplugin.TypedName{Name: name, Type: testPickerType}}}, nil
 	})
 
-	fwkplugin.Register(testProfileHandler, func(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
+	fwkplugin.Register(testProfileHandler, fwkplugin.StabilityStable, func(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
 		return &mockHandler{mockPlugin{t: fwkplugin.TypedName{Name: name, Type: testProfileHandler}}}, nil
 	})
 
-	fwkplugin.Register(testSourceType, func(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
+	fwkplugin.RegisterWithPluginDependencies(testWithDependencies, fwkplugin.StabilityStable,
+		func(name string, decoder *json.Decoder, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
+			rawCfg, err := mockWithDependenciesConfigParser(decoder, handle)
+			if err != nil {
+				return nil, err
+			}
+			cfg := rawCfg.(*mockWithDependenciesConfig)
+			if dependency := handle.Plugin(cfg.Dependency); dependency == nil {
+				return nil, fmt.Errorf("failed to find dependency %s", cfg.Dependency)
+			}
+			if cfg.PointedTo != nil {
+				if dependency := handle.Plugin(*cfg.PointedTo); dependency == nil {
+					return nil, fmt.Errorf("failed to find dependency %s", *cfg.PointedTo)
+				}
+			}
+			return &mockWithDependencies{mockPlugin{t: fwkplugin.TypedName{Name: name, Type: testWithDependencies}}}, nil
+		}, mockWithDependenciesConfigParser,
+	)
+
+	fwkplugin.RegisterWithPluginDependencies(testWithNestedDependencies, fwkplugin.StabilityStable,
+		func(name string, decoder *json.Decoder, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
+			rawCfg, err := mockWithNestedDependenciesConfigParser(decoder, handle)
+			if err != nil {
+				return nil, err
+			}
+			cfg := rawCfg.(*mockWithNestedDependenciesConfig)
+			if dependency := handle.Plugin(cfg.Nested.Dependency); dependency == nil {
+				return nil, fmt.Errorf("failed to find dependency %s", cfg.Nested.Dependency)
+			}
+			for _, pluginName := range cfg.Extras {
+				if dependency := handle.Plugin(pluginName); dependency == nil {
+					return nil, fmt.Errorf("failed to find dependency %s", pluginName)
+				}
+			}
+			if cfg.NestedPtr != nil {
+				if dependency := handle.Plugin(cfg.NestedPtr.Dependency); dependency == nil {
+					return nil, fmt.Errorf("failed to find dependency %s", cfg.NestedPtr.Dependency)
+				}
+			}
+			if cfg.PointedTo != nil {
+				if dependency := handle.Plugin(*cfg.PointedTo); dependency == nil {
+					return nil, fmt.Errorf("failed to find dependency %s", *cfg.PointedTo)
+				}
+			}
+			return &mockWithNestedDependencies{mockPlugin{t: fwkplugin.TypedName{Name: name, Type: testWithNestedDependencies}}}, nil
+		}, mockWithNestedDependenciesConfigParser,
+	)
+
+	fwkplugin.Register(testSourceType, fwkplugin.StabilityStable, func(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
 		return &mockSource{mockPlugin{t: fwkplugin.TypedName{Name: name, Type: testSourceType}}}, nil
 	})
 
-	fwkplugin.Register(testExtractorType, func(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
+	fwkplugin.Register(testExtractorType, fwkplugin.StabilityStable, func(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
 		return &mockExtractor{mockPlugin{t: fwkplugin.TypedName{Name: name, Type: testExtractorType}}}, nil
 	})
 
-	fwkplugin.Register(globalstrict.GlobalStrictFairnessPolicyType, func(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
+	fwkplugin.Register(globalstrict.GlobalStrictFairnessPolicyType, fwkplugin.StabilityStable, func(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
 		return &fwkfcmocks.MockFairnessPolicy{
 			TypedNameV: fwkplugin.TypedName{Name: name, Type: globalstrict.GlobalStrictFairnessPolicyType},
 		}, nil
 	})
-	fwkplugin.Register(fcfs.FCFSOrderingPolicyType, func(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
+	fwkplugin.Register(fcfs.FCFSOrderingPolicyType, fwkplugin.StabilityStable, func(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
 		return &fwkfcmocks.MockOrderingPolicy{
 			TypedNameV: fwkplugin.TypedName{Name: name, Type: fcfs.FCFSOrderingPolicyType},
 		}, nil
 	})
 
 	// Ensure system defaults are registered too.
-	fwkplugin.Register(maxscore.MaxScorePickerType, maxscore.MaxScorePickerFactory)
-	fwkplugin.Register(single.SingleProfileHandlerType, single.SingleProfileHandlerFactory)
-	fwkplugin.Register(openai.OpenAIParserType, openai.OpenAIParserPluginFactory)
-	fwkplugin.Register(vertexai.VertexAIParserType, vertexai.VertexAIParserPluginFactory)
-	fwkplugin.Register(anthropic.AnthropicParserType, anthropic.AnthropicParserPluginFactory)
-	fwkplugin.Register(vllmhttp.VllmHTTPParserType, vllmhttp.VllmHTTPParserPluginFactory)
-	fwkplugin.Register(usagelimits.StaticUsageLimitPolicyType, usagelimits.StaticPolicyFactory)
-	fwkplugin.Register(prefix.PrefixCacheScorerPluginType, prefix.PrefixCachePluginFactory)
-	fwkplugin.Register(reqdataprodprefix.ApproxPrefixCachePluginType, reqdataprodprefix.ApproxPrefixCacheFactory)
+	fwkplugin.Register(maxscore.MaxScorePickerType, fwkplugin.StabilityStable, maxscore.MaxScorePickerFactory)
+	fwkplugin.Register(single.SingleProfileHandlerType, fwkplugin.StabilityStable, single.SingleProfileHandlerFactory)
+	fwkplugin.Register(openai.OpenAIParserType, fwkplugin.StabilityStable, openai.OpenAIParserPluginFactory)
+	fwkplugin.Register(vertexai.VertexAIParserType, fwkplugin.StabilityStable, vertexai.VertexAIParserPluginFactory)
+	fwkplugin.Register(anthropic.AnthropicParserType, fwkplugin.StabilityStable, anthropic.AnthropicParserPluginFactory)
+	fwkplugin.Register(vllmhttp.VllmHTTPParserType, fwkplugin.StabilityStable, vllmhttp.VllmHTTPParserPluginFactory)
+	fwkplugin.Register(usagelimits.StaticUsageLimitPolicyType, fwkplugin.StabilityStable, usagelimits.StaticPolicyFactory)
+	fwkplugin.Register(prefix.PrefixCacheScorerPluginType, fwkplugin.StabilityStable, prefix.PrefixCachePluginFactory)
+	fwkplugin.Register(reqdataprodprefix.ApproxPrefixCachePluginType, fwkplugin.StabilityStable, reqdataprodprefix.ApproxPrefixCacheFactory)
 	// Datalayer plugins are now defaults; register their real factories.
-	fwkplugin.Register(sourcemetrics.MetricsDataSourceType, sourcemetrics.MetricsDataSourceFactory)
-	fwkplugin.Register(extractormetrics.MetricsExtractorType, extractormetrics.CoreMetricsExtractorFactory)
+	fwkplugin.Register(sourcemetrics.MetricsDataSourceType, fwkplugin.StabilityStable, sourcemetrics.MetricsDataSourceFactory)
+	fwkplugin.Register(extractormetrics.MetricsExtractorType, fwkplugin.StabilityStable, extractormetrics.CoreMetricsExtractorFactory)
 }
 
 func TestValidateSaturationDetector(t *testing.T) {
@@ -1023,7 +1284,7 @@ func TestEnsureSaturationDetector(t *testing.T) {
 				},
 			},
 		}
-		handle := igwtestutils.NewTestHandle(context.Background())
+		handle := testutils.NewTestHandle(context.Background())
 		allPlugins := map[string]fwkplugin.Plugin{
 			"existing-plugin": &mockSaturationDetector{},
 		}
@@ -1041,7 +1302,7 @@ func TestEnsureSaturationDetector(t *testing.T) {
 				},
 			},
 		}
-		handle := igwtestutils.NewTestHandle(context.Background())
+		handle := testutils.NewTestHandle(context.Background())
 		allPlugins := map[string]fwkplugin.Plugin{
 			"utilization-detector": &mockSaturationDetector{},
 		}
@@ -1074,4 +1335,44 @@ func TestFilterExecutionOrderFromYAML(t *testing.T) {
 	}
 	require.Equal(t, []string{"filter-A", "filter-B", "filter-C", "scorer-X", "scorer-Y", "maxScorePicker"}, pluginRefs,
 		"Plugins slice must preserve YAML declaration order")
+}
+
+func TestAllowExperimentalPluginsFlag(t *testing.T) {
+	const alphaPluginType = "test-alpha-plugin"
+	fwkplugin.Register(alphaPluginType, fwkplugin.StabilityAlpha, func(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
+		return &mockPlugin{t: fwkplugin.TypedName{Name: name, Type: alphaPluginType}}, nil
+	})
+	fwkplugin.Register(single.SingleProfileHandlerType, fwkplugin.StabilityStable, single.SingleProfileHandlerFactory)
+	fwkplugin.Register("utilization-detector", fwkplugin.StabilityStable, func(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
+		return &mockSaturationDetector{mockPlugin{t: fwkplugin.TypedName{Name: name, Type: "utilization-detector"}}}, nil
+	})
+
+	handle := testutils.NewTestHandle(context.Background())
+	logger := logging.NewTestLogger()
+
+	rawConfig := &configapi.EndpointPickerConfig{
+		Plugins: []configapi.PluginSpec{
+			{Name: "alpha-inst", Type: alphaPluginType},
+			{Name: "ph", Type: single.SingleProfileHandlerType},
+			{Name: "sat", Type: "utilization-detector"},
+		},
+		SchedulingProfiles: []configapi.SchedulingProfile{
+			{Name: "default", Plugins: []configapi.SchedulingPlugin{{PluginRef: "ph"}}},
+		},
+		FlowControl: &configapi.FlowControlConfig{
+			SaturationDetector: &configapi.SaturationDetectorConfig{PluginRef: "sat"},
+		},
+	}
+
+	_, err := InstantiateAndConfigure(rawConfig, handle, logger)
+	require.NoError(t, err)
+
+	// 1. Without flag enabled (allowExperimentalPlugins = false) -> should fail
+	err = fwkplugin.ValidatePluginStability(handle, false)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "has Alpha stability level, but command line flag --allow-experimental-plugins is not set")
+
+	// 2. With flag enabled (allowExperimentalPlugins = true) -> should succeed
+	err = fwkplugin.ValidatePluginStability(handle, true)
+	require.NoError(t, err)
 }

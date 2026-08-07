@@ -20,8 +20,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/llm-d/llm-d-kv-cache/pkg/tokenization"
-	tokenizerTypes "github.com/llm-d/llm-d-kv-cache/pkg/tokenization/types"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/tokenization"
+	tokenizerTypes "github.com/llm-d/llm-d-router/pkg/kvcache/tokenization/types"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -36,6 +36,65 @@ import (
 	preciseproducer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/preciseprefixcache"
 	"github.com/llm-d/llm-d-router/test/utils"
 )
+
+func TestAnyMMHit(t *testing.T) {
+	const producerName = "test-producer"
+	key := attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(producerName).String()
+	makeEndpoint := func(name string, info *attrprefix.PrefixCacheMatchInfo) scheduling.Endpoint {
+		ep := scheduling.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: name}}, fwkdl.NewMetrics(), nil)
+		if info != nil {
+			ep.Put(key, info)
+		}
+		return ep
+	}
+
+	tests := []struct {
+		name        string
+		endpoints   []scheduling.Endpoint
+		wantHit     bool
+		wantTracked bool
+	}{
+		{name: "no endpoints", endpoints: nil},
+		{
+			name: "no match info attached",
+			endpoints: []scheduling.Endpoint{
+				makeEndpoint("a", nil),
+				makeEndpoint("b", nil),
+			},
+		},
+		{
+			name: "no producer tracked mm",
+			endpoints: []scheduling.Endpoint{
+				makeEndpoint("a", attrprefix.NewPrefixCacheMatchInfo(5, 10, 16)),
+				makeEndpoint("b", attrprefix.NewPrefixCacheMatchInfo(8, 10, 16)),
+			},
+		},
+		{
+			name: "tracked but zero mm matches",
+			endpoints: []scheduling.Endpoint{
+				makeEndpoint("a", attrprefix.NewPrefixCacheMatchInfo(5, 10, 16)),
+				makeEndpoint("b", attrprefix.NewPrefixCacheMatchInfo(8, 10, 16).WithMM(attrprefix.MMMatchInfo{MatchBlocks: 0})),
+			},
+			wantTracked: true,
+		},
+		{
+			name: "one endpoint reports mm match",
+			endpoints: []scheduling.Endpoint{
+				makeEndpoint("a", attrprefix.NewPrefixCacheMatchInfo(5, 10, 16)),
+				makeEndpoint("b", attrprefix.NewPrefixCacheMatchInfo(8, 10, 16).WithMM(attrprefix.MMMatchInfo{MatchBlocks: 2})),
+			},
+			wantHit: true, wantTracked: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hit, tracked := anyMMHit(tt.endpoints, key)
+			assert.Equal(t, tt.wantHit, hit, "hit")
+			assert.Equal(t, tt.wantTracked, tracked, "tracked")
+		})
+	}
+}
 
 // In self-host mode the plugin satisfies Scorer, DataProducer, PreRequest,
 // and EndpointExtractor.
@@ -172,7 +231,10 @@ func TestLegacyProducer_TokenizesCompletionPromptViaPool(t *testing.T) {
 
 	req := &scheduling.InferenceRequest{
 		Body: &fwkrh.InferenceRequestBody{
-			Completions: &fwkrh.CompletionsRequest{Prompt: fwkrh.Prompt{Raw: "hello world"}},
+			Completions: &fwkrh.CompletionsRequest{
+				Prompt:    fwkrh.Prompt{Raw: "hello world"},
+				CacheSalt: "leg-salt",
+			},
 		},
 	}
 	require.NoError(t, lp.Produce(ctx, req, nil))
@@ -180,7 +242,10 @@ func TestLegacyProducer_TokenizesCompletionPromptViaPool(t *testing.T) {
 	assert.Equal(t, 1, stub.calls)
 	assert.Equal(t, "hello world", stub.lastRaw)
 	require.NotNil(t, req.Body.TokenizedPrompt)
-	assert.Equal(t, []uint32{1, 2, 3}, req.Body.TokenizedPrompt.TokenIDs)
+	assert.Equal(t, []uint32{1, 2, 3}, req.Body.TokenizedPrompt.PerPromptTokens[0])
+	// Wrapper-owned tokenization must still carry the cache salt so precise
+	// keys stay isolated on this path.
+	assert.Equal(t, "leg-salt", req.Body.TokenizedPrompt.CacheSalt)
 }
 
 // End-to-end: tokens from the pool flow into the embedded producer, get
@@ -213,9 +278,9 @@ func TestLegacyProducer_TokensFlowToEndpointAttribute(t *testing.T) {
 		},
 	}
 	endpoint := scheduling.NewEndpoint(&fwkdl.EndpointMetadata{
-		NamespacedName: k8stypes.NamespacedName{Name: "pod1"},
-		Address:        "10.0.0.1",
-		Port:           "8000",
+		ID:      k8stypes.NamespacedName{Name: "pod1"},
+		Address: "10.0.0.1",
+		Port:    "8000",
 	}, nil, nil)
 
 	require.NoError(t, lp.Produce(ctx, req, []scheduling.Endpoint{endpoint}))
@@ -249,12 +314,12 @@ func TestLegacyProducer_KeepsExistingTokenizedPrompt(t *testing.T) {
 
 	req := &scheduling.InferenceRequest{
 		Body: &fwkrh.InferenceRequestBody{
-			TokenizedPrompt: &fwkrh.TokenizedPrompt{TokenIDs: []uint32{5, 5, 5}},
+			TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{{5, 5, 5}}},
 			Completions:     &fwkrh.CompletionsRequest{Prompt: fwkrh.Prompt{Raw: "should not tokenize"}},
 		},
 	}
 	require.NoError(t, lp.Produce(ctx, req, nil))
 
 	assert.Equal(t, 0, stub.calls, "pool must not be called when tokens already present")
-	assert.Equal(t, []uint32{5, 5, 5}, req.Body.TokenizedPrompt.TokenIDs)
+	assert.Equal(t, []uint32{5, 5, 5}, req.Body.TokenizedPrompt.PerPromptTokens[0])
 }

@@ -32,9 +32,7 @@ var _ = Describe("Data Parallel support", func() {
 			// tell the proxy that it is listening on that port minus one.
 			freePort, err := testutils.GetFreePort()
 			Expect(err).ToNot(HaveOccurred())
-			tmpPort, err := strconv.Atoi(freePort)
-			fakeProxyPort := tmpPort - 1
-			Expect(err).ToNot(HaveOccurred())
+			fakeProxyPort := freePort - 1
 
 			// The data parallel support, assumes that the decoders are
 			// listening on a set of contiguous ports. Get a free port
@@ -43,12 +41,12 @@ var _ = Describe("Data Parallel support", func() {
 			rank1Server := httptest.NewServer(&rank1Handler)
 			tempURL, err := url.Parse(rank1Server.URL)
 			Expect(err).ToNot(HaveOccurred())
-			tmpPort, err = strconv.Atoi(tempURL.Port())
+			tmpPort, err := strconv.Atoi(tempURL.Port())
 			Expect(err).ToNot(HaveOccurred())
 			fakeDecodePort := tmpPort - 1
 
 			DeferCleanup(os.Setenv, "POD_IP", os.Getenv("POD_IP"))
-			err = os.Setenv("POD_IP", "127.0.0.1")
+			err = os.Setenv("POD_IP", testLoopbackIP)
 			Expect(err).ToNot(HaveOccurred())
 
 			decodeURL, err := url.Parse("http://localhost:" + strconv.Itoa(fakeDecodePort))

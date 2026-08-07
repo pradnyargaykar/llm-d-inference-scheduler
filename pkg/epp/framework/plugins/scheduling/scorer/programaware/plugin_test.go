@@ -22,7 +22,7 @@ func TestProgramAwareScorer(t *testing.T) {
 	attrA := fwkdl.NewAttributes()
 	attrA.Put(matchKey, attrprefix.NewPrefixCacheMatchInfo(10, 10, 16)) // 100% cache hit
 	endpointA := scheduling.NewEndpoint(
-		&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod-a"}},
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod-a"}},
 		&fwkdl.Metrics{
 			WaitingQueueSize:    2,
 			KVCacheUsagePercent: 0.5,
@@ -32,7 +32,7 @@ func TestProgramAwareScorer(t *testing.T) {
 
 	// Pod B: Cache miss, completely idle (load = 0, kvUtil = 0.1)
 	endpointB := scheduling.NewEndpoint(
-		&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod-b"}},
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod-b"}},
 		&fwkdl.Metrics{
 			WaitingQueueSize:    0,
 			KVCacheUsagePercent: 0.1,

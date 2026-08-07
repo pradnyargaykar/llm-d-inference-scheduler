@@ -97,13 +97,13 @@ type Selector struct {
 
 ### Factory function
 
-Plugins are instantiated via factory functions. The factory receives the instance name, raw JSON parameters from the configuration, and a `plugin.Handle`:
+Plugins are instantiated via factory functions. The factory receives the instance name, a `*json.Decoder` over the plugin's raw configuration parameters (or `nil` when the plugin was instantiated without parameters), and a `plugin.Handle`:
 
 ```go
-func SelectorFactory(name string, rawParameters json.RawMessage, _ plugin.Handle) (plugin.Plugin, error) {
+func SelectorFactory(name string, rawParameters *json.Decoder, _ plugin.Handle) (plugin.Plugin, error) {
     parameters := metav1.LabelSelector{}
     if rawParameters != nil {
-        if err := json.Unmarshal(rawParameters, &parameters); err != nil {
+        if err := rawParameters.Decode(&parameters); err != nil {
             return nil, fmt.Errorf("failed to parse the parameters of the '%s' filter - %w", LabelSelectorFilterType, err)
         }
     }
@@ -158,18 +158,19 @@ Once a filter is defined, two steps are needed to make it available:
 
 ### 1. Register the factory
 
-Add an import and a `plugin.Register` call in [`runner.go`](https://github.com/llm-d/llm-d-router/blob/main/cmd/epp/runner/runner.go):
+Add an import and a `plugin.Register` call in [`runner.go`](https://github.com/llm-d/llm-d-router/blob/main/cmd/epp/runner/runner.go). New plugins should generally be registered with `plugin.StabilityAlpha` unless intended to be enabled by default:
 
 ```go
 import (
     // ...existing imports...
+    "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
     "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
     // ...
 )
 
 func registerInTreePlugins() {
     // ...existing registrations...
-    plugin.Register(bylabel.LabelSelectorFilterType, bylabel.SelectorFactory)
+    plugin.Register(bylabel.LabelSelectorFilterType, plugin.StabilityAlpha, bylabel.SelectorFactory)
 }
 ```
 

@@ -66,47 +66,47 @@ var (
 
 // --- Inference Objective Metrics ---
 var (
-	// Deprecated: Use llm_d_router_epp_request_total instead.
+	// Deprecated: Use llm_d_epp_request_total instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	requestCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Subsystem: inferenceObjectiveComponent,
 			Name:      "request_total",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_request_total] Counter of inference objective requests broken out for each model and target model.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_request_total] Counter of inference objective requests broken out for each model and target model.", compbasemetrics.ALPHA),
 		},
 		modelWithPriorityLabels,
 	)
 
-	// Deprecated: Use llm_d_router_epp_request_error_total instead.
+	// Deprecated: Use llm_d_epp_request_error_total instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	requestErrCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Subsystem: inferenceObjectiveComponent,
 			Name:      "request_error_total",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_request_error_total] Counter of inference objective requests errors broken out for each model and target model.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_request_error_total] Counter of inference objective requests errors broken out for each model and target model.", compbasemetrics.ALPHA),
 		},
 		append(modelLabels, "error_code"),
 	)
 
-	// Deprecated: Use llm_d_router_epp_request_duration_seconds instead.
+	// Deprecated: Use llm_d_epp_request_duration_seconds instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	requestLatencies = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Subsystem: inferenceObjectiveComponent,
 			Name:      "request_duration_seconds",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_request_duration_seconds] Inference objective response latency distribution in seconds for each model and target model.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_request_duration_seconds] Inference objective response latency distribution in seconds for each model and target model.", compbasemetrics.ALPHA),
 			Buckets:   generalLatencyBuckets,
 		},
 		modelLabels,
 	)
 
-	// Deprecated: Use llm_d_router_epp_request_sizes instead.
+	// Deprecated: Use llm_d_epp_request_size_bytes instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	requestSizes = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Subsystem: inferenceObjectiveComponent,
 			Name:      "request_sizes",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_request_sizes] Inference objective requests size distribution in bytes for each model and target model.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_request_size_bytes] Inference objective requests size distribution in bytes for each model and target model.", compbasemetrics.ALPHA),
 			// Use buckets ranging from 1000 bytes (1KB) to 10^9 bytes (1GB).
 			Buckets: []float64{
 				64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, // More fine-grained up to 64KB
@@ -117,13 +117,13 @@ var (
 		modelLabels,
 	)
 
-	// Deprecated: Use llm_d_router_epp_response_sizes instead.
+	// Deprecated: Use llm_d_epp_response_size_bytes instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	responseSizes = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Subsystem: inferenceObjectiveComponent,
 			Name:      "response_sizes",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_response_sizes] Inference objective responses size distribution in bytes for each model and target model.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_response_size_bytes] Inference objective responses size distribution in bytes for each model and target model.", compbasemetrics.ALPHA),
 			// Most models have a response token < 8192 tokens. Each token, in average, has 4 characters.
 			// 8192 * 4 = 32768.
 			Buckets: []float64{1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32778, 65536},
@@ -131,63 +131,63 @@ var (
 		modelLabels,
 	)
 
-	// Deprecated: Use llm_d_router_epp_input_tokens instead.
+	// Deprecated: Use llm_d_epp_request_input_tokens instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	inputTokens = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Subsystem: inferenceObjectiveComponent,
 			Name:      "input_tokens",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_input_tokens] Inference objective input token count distribution for requests in each model.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_request_input_tokens] Inference objective input token count distribution for requests in each model.", compbasemetrics.ALPHA),
 			// Most models have a input context window less than 1 million tokens.
 			Buckets: []float64{1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32778, 65536, 131072, 262144, 524288, 1048576},
 		},
 		modelLabels,
 	)
 
-	// Deprecated: Use llm_d_router_epp_output_tokens instead.
+	// Deprecated: Use llm_d_epp_request_output_tokens instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	outputTokens = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Subsystem: inferenceObjectiveComponent,
 			Name:      "output_tokens",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_output_tokens] Inference objective output token count distribution for requests in each model.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_request_output_tokens] Inference objective output token count distribution for requests in each model.", compbasemetrics.ALPHA),
 			// Most models generates output less than 8192 tokens.
 			Buckets: []float64{1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192},
 		},
 		modelLabels,
 	)
 
-	// Deprecated: Use llm_d_router_epp_prompt_cached_tokens instead.
+	// Deprecated: Use llm_d_epp_request_cached_tokens instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	promptCachedTokens = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Subsystem: inferenceObjectiveComponent,
 			Name:      "prompt_cached_tokens",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_prompt_cached_tokens] Inference objective prompt cached token count distribution for requests in each model.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_request_cached_tokens] Inference objective prompt cached token count distribution for requests in each model.", compbasemetrics.ALPHA),
 			// Most models have a input context window less than 1 million tokens.
 			Buckets: []float64{1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32778, 65536, 131072, 262144, 524288, 1048576},
 		},
 		modelLabels,
 	)
 
-	// Deprecated: Use llm_d_router_epp_running_requests instead.
+	// Deprecated: Use llm_d_epp_request_running instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	runningRequests = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Subsystem: inferenceObjectiveComponent,
 			Name:      "running_requests",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_running_requests] Inference objective number of running requests in each model.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_request_running] Inference objective number of running requests in each model.", compbasemetrics.ALPHA),
 		},
 		[]string{"model_name"},
 	)
 
-	// Deprecated: Use llm_d_router_epp_normalized_time_per_output_token_seconds instead.
+	// Deprecated: Use llm_d_epp_request_ntpot_seconds instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	normalizedTimePerOutputToken = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Subsystem: inferenceObjectiveComponent,
 			Name:      "normalized_time_per_output_token_seconds",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_normalized_time_per_output_token_seconds] Inference objective latency divided by number of output tokens in seconds for each model and target model.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_request_ntpot_seconds] Inference objective latency divided by number of output tokens in seconds for each model and target model.", compbasemetrics.ALPHA),
 			// From few milliseconds per token to multiple seconds per token
 			Buckets: []float64{
 				0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0,
@@ -199,46 +199,46 @@ var (
 
 // --- Inference Pool Metrics ---
 var (
-	// Deprecated: Use llm_d_router_epp_average_kv_cache_utilization instead.
+	// Deprecated: Use llm_d_epp_average_kv_cache_utilization instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	inferencePoolAvgKVCache = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Subsystem: inferencePoolComponent,
 			Name:      "average_kv_cache_utilization",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_average_kv_cache_utilization] The average kv cache utilization for an inference server pool.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_average_kv_cache_utilization] The average kv cache utilization for an inference server pool.", compbasemetrics.ALPHA),
 		},
 		poolLabels,
 	)
 
-	// Deprecated: Use llm_d_router_epp_average_queue_size instead.
+	// Deprecated: Use llm_d_epp_average_queue_size instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	inferencePoolAvgQueueSize = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Subsystem: inferencePoolComponent,
 			Name:      "average_queue_size",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_average_queue_size] The average number of requests pending in the model server queue.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_average_queue_size] The average number of requests pending in the model server queue.", compbasemetrics.ALPHA),
 		},
 		poolLabels,
 	)
 
-	// Deprecated: Use llm_d_router_epp_average_running_requests instead.
+	// Deprecated: Use llm_d_epp_average_running_requests instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	inferencePoolAvgRunningRequests = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Subsystem: inferencePoolComponent,
 			Name:      "average_running_requests",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_average_running_requests] The average number of running requests across model servers in the pool.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_average_running_requests] The average number of running requests across model servers in the pool.", compbasemetrics.ALPHA),
 		},
 		poolLabels,
 	)
 
-	// Deprecated: Use llm_d_router_epp_ready_endpoints instead.
+	// Deprecated: Use llm_d_epp_ready_endpoints instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	inferencePoolReadyPods = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Subsystem: inferencePoolComponent,
 			Name:      "ready_pods",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_ready_endpoints] The number of ready pods in the inference server pool.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_ready_endpoints] The number of ready pods in the inference server pool.", compbasemetrics.ALPHA),
 		},
 		poolLabels,
 	)
@@ -246,13 +246,13 @@ var (
 
 // --- Scheduling Metrics ---
 var (
-	// Deprecated: Use llm_d_router_epp_scheduler_e2e_duration_seconds instead.
+	// Deprecated: Use llm_d_epp_scheduler_e2e_duration_seconds instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	schedulerE2ELatency = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Subsystem: inferenceExtension,
 			Name:      "scheduler_e2e_duration_seconds",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_scheduler_e2e_duration_seconds] End-to-end scheduling latency distribution in seconds.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_scheduler_e2e_duration_seconds] End-to-end scheduling latency distribution in seconds.", compbasemetrics.ALPHA),
 			Buckets: []float64{
 				0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1,
 			},
@@ -260,24 +260,24 @@ var (
 		[]string{},
 	)
 
-	// Deprecated: Use llm_d_router_epp_scheduler_attempts_total instead.
+	// Deprecated: Use llm_d_epp_scheduler_attempts_total instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	schedulerAttemptsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Subsystem: inferenceExtension,
 			Name:      "scheduler_attempts_total",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_scheduler_attempts_total] Total number of scheduling attempts.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_scheduler_attempts_total] Total number of scheduling attempts.", compbasemetrics.ALPHA),
 		},
 		append([]string{"status", "target_model_name"}, endpointLabels...),
 	)
 
-	// Deprecated: Use llm_d_router_epp_plugin_duration_seconds instead.
+	// Deprecated: Use llm_d_epp_plugin_duration_seconds instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	pluginProcessingLatencies = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Subsystem: inferenceExtension,
 			Name:      "plugin_duration_seconds",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_plugin_duration_seconds] Plugin processing latency distribution in seconds for each extension point, plugin type and plugin name.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_plugin_duration_seconds] Plugin processing latency distribution in seconds for each extension point, plugin type and plugin name.", compbasemetrics.ALPHA),
 			Buckets: []float64{
 				0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1,
 			},
@@ -298,13 +298,13 @@ var inferenceExtensionInfo = prometheus.NewGaugeVec(
 
 // --- Flow Control Metrics ---
 var (
-	// Deprecated: Use llm_d_router_epp_flow_control_request_queue_duration_seconds instead.
+	// Deprecated: Use llm_d_epp_flow_control_request_queue_duration_seconds instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	flowControlRequestQueueDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Subsystem: inferenceExtension,
 			Name:      "flow_control_request_queue_duration_seconds",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_flow_control_request_queue_duration_seconds] Distribution of total time requests spend in the Flow Control layer (from enqueue to final outcome).", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_flow_control_request_queue_duration_seconds] Distribution of total time requests spend in the Flow Control layer (from enqueue to final outcome).", compbasemetrics.ALPHA),
 			Buckets: []float64{
 				0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 			},
@@ -312,13 +312,13 @@ var (
 		append([]string{"fairness_id", "priority", "outcome", "inference_pool"}, modelLabels...),
 	)
 
-	// Deprecated: Use llm_d_router_epp_flow_control_dispatch_cycle_duration_seconds instead.
+	// Deprecated: Use llm_d_epp_flow_control_dispatch_cycle_duration_seconds instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	flowControlDispatchCycleDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Subsystem: inferenceExtension,
 			Name:      "flow_control_dispatch_cycle_duration_seconds",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_flow_control_dispatch_cycle_duration_seconds] Distribution of time taken for each internal dispatch cycle in the Flow Control layer.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_flow_control_dispatch_cycle_duration_seconds] Distribution of time taken for each internal dispatch cycle in the Flow Control layer.", compbasemetrics.ALPHA),
 			Buckets: []float64{
 				0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1,
 			},
@@ -326,13 +326,13 @@ var (
 		[]string{},
 	)
 
-	// Deprecated: Use llm_d_router_epp_flow_control_request_enqueue_duration_seconds instead.
+	// Deprecated: Use llm_d_epp_flow_control_request_enqueue_duration_seconds instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	flowControlRequestEnqueueDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Subsystem: inferenceExtension,
 			Name:      "flow_control_request_enqueue_duration_seconds",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_flow_control_request_enqueue_duration_seconds] Distribution of time taken to enqueue requests into the Flow Control layer.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_flow_control_request_enqueue_duration_seconds] Distribution of time taken to enqueue requests into the Flow Control layer.", compbasemetrics.ALPHA),
 			Buckets: []float64{
 				0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1,
 			},
@@ -340,35 +340,41 @@ var (
 		[]string{"fairness_id", "priority", "outcome"},
 	)
 
-	// Deprecated: Use llm_d_router_epp_flow_control_queue_size instead.
+	// Deprecated: Use llm_d_epp_flow_control_queue_size instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	flowControlQueueSize = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Subsystem: inferenceExtension,
 			Name:      "flow_control_queue_size",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_flow_control_queue_size] Current number of requests actively held in the Flow Control queue.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_flow_control_queue_size] Current number of requests actively held in the Flow Control queue.", compbasemetrics.ALPHA),
 		},
 		append([]string{"fairness_id", "priority", "inference_pool"}, modelLabels...),
 	)
 
-	// Deprecated: Use llm_d_router_epp_flow_control_queue_bytes instead.
+	// Deprecated: Use llm_d_epp_flow_control_queue_bytes instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	flowControlQueueBytes = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Subsystem: inferenceExtension,
 			Name:      "flow_control_queue_bytes",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_flow_control_queue_bytes] Current total size in bytes of requests actively held in the Flow Control queue.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_flow_control_queue_bytes] Current total size in bytes of requests actively held in the Flow Control queue.", compbasemetrics.ALPHA),
 		},
 		append([]string{"fairness_id", "priority", "inference_pool"}, modelLabels...),
 	)
 
-	// Deprecated: Use llm_d_router_epp_flow_control_pool_saturation instead.
+	// Deprecated: Use llm_d_epp_flow_control_pool_saturation instead.
 	// Tracked in: https://github.com/llm-d/llm-d-inference-scheduler/issues/1070
 	flowControlPoolSaturation = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Subsystem: inferenceExtension,
 			Name:      "flow_control_pool_saturation",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_flow_control_pool_saturation] Current saturation level of the inference pool (0.0 = empty, 1.0 = fully saturated).", compbasemetrics.ALPHA),
+			Help: metricsutil.HelpMsgWithStability(
+				"[Deprecated: Use llm_d_epp_flow_control_pool_saturation] Pool saturation signal gating Flow Control "+
+					"dispatch. 1.0 is the gating set point; values above 1.0 indicate the magnitude of oversubscription "+
+					"past it. An empty pool reads as 1.0. With the default utilization detector, endpoints with missing "+
+					"or stale metrics score as fully saturated (fail-closed; see "+
+					"llm_d_epp_flow_control_stale_endpoints).",
+				compbasemetrics.ALPHA),
 		},
 		[]string{"inference_pool"},
 	)
@@ -394,7 +400,7 @@ var (
 		prometheus.CounterOpts{
 			Subsystem: SchedulerSubsystem,
 			Name:      "datalayer_poll_errors_total",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_datalayer_poll_errors_total] Data-source poll errors per source type.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_datalayer_poll_errors_total] Data-source poll errors per source type.", compbasemetrics.ALPHA),
 		},
 		[]string{"source_type"},
 	)
@@ -406,7 +412,7 @@ var (
 		prometheus.CounterOpts{
 			Subsystem: SchedulerSubsystem,
 			Name:      "datalayer_extract_errors_total",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_router_epp_datalayer_extract_errors_total] Extract errors per source/extractor type.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_datalayer_extract_errors_total] Extract errors per source/extractor type.", compbasemetrics.ALPHA),
 		},
 		[]string{"source_type", "extractor_type"},
 	)
@@ -438,12 +444,18 @@ func Register(customCollectors ...prometheus.Collector) {
 		metrics.Registry.MustRegister(llmdRunningRequests)
 		metrics.Registry.MustRegister(normalizedTimePerOutputToken)
 		metrics.Registry.MustRegister(llmdNormalizedTimePerOutputToken)
+		metrics.Registry.MustRegister(llmdRequestTTFT)
+		metrics.Registry.MustRegister(llmdRequestTPOT)
+		metrics.Registry.MustRegister(llmdInterTokenLatency)
 		metrics.Registry.MustRegister(inferencePoolAvgKVCache)
 		metrics.Registry.MustRegister(llmdInferencePoolAvgKVCache)
+		metrics.Registry.MustRegister(llmdInferencePoolStdDevKVCache)
 		metrics.Registry.MustRegister(inferencePoolAvgQueueSize)
 		metrics.Registry.MustRegister(llmdInferencePoolAvgQueueSize)
+		metrics.Registry.MustRegister(llmdInferencePoolStdDevQueueSize)
 		metrics.Registry.MustRegister(inferencePoolAvgRunningRequests)
 		metrics.Registry.MustRegister(llmdInferencePoolAvgRunningRequests)
+		metrics.Registry.MustRegister(llmdInferencePoolStdDevRunningRequests)
 		metrics.Registry.MustRegister(inferencePoolReadyPods)
 		metrics.Registry.MustRegister(llmdInferencePoolReadyEndpoints)
 		metrics.Registry.MustRegister(schedulerE2ELatency)
@@ -452,6 +464,8 @@ func Register(customCollectors ...prometheus.Collector) {
 		metrics.Registry.MustRegister(llmdSchedulerAttemptsTotal)
 		metrics.Registry.MustRegister(pluginProcessingLatencies)
 		metrics.Registry.MustRegister(llmdPluginProcessingLatencies)
+		metrics.Registry.MustRegister(llmdRequestProcessingLatency)
+		metrics.Registry.MustRegister(llmdResponseProcessingLatency)
 		metrics.Registry.MustRegister(inferenceExtensionInfo)
 		metrics.Registry.MustRegister(llmdInferenceExtensionInfo)
 		metrics.Registry.MustRegister(flowControlRequestQueueDuration)
@@ -464,8 +478,12 @@ func Register(customCollectors ...prometheus.Collector) {
 		metrics.Registry.MustRegister(llmdFlowControlQueueBytes)
 		metrics.Registry.MustRegister(flowControlPoolSaturation)
 		metrics.Registry.MustRegister(llmdFlowControlPoolSaturation)
+		// No deprecated inference_extension twin: new flow control metrics are emitted under the
+		// llm_d_epp prefix only.
+		metrics.Registry.MustRegister(llmdFlowControlStaleEndpoints)
 		metrics.Registry.MustRegister(flowControlRequestEnqueueDuration)
 		metrics.Registry.MustRegister(llmdFlowControlRequestEnqueueDuration)
+		metrics.Registry.MustRegister(llmdFlowControlRequestsTotal)
 		metrics.Registry.MustRegister(inferenceModelRewriteDecisionsTotal)
 		metrics.Registry.MustRegister(llmdInferenceModelRewriteDecisionsTotal)
 		metrics.Registry.MustRegister(DataLayerPollErrorsTotal)
@@ -501,12 +519,18 @@ func Reset() {
 	llmdRunningRequests.Reset()
 	normalizedTimePerOutputToken.Reset()
 	llmdNormalizedTimePerOutputToken.Reset()
+	llmdRequestTTFT.Reset()
+	llmdRequestTPOT.Reset()
+	llmdInterTokenLatency.Reset()
 	inferencePoolAvgKVCache.Reset()
 	llmdInferencePoolAvgKVCache.Reset()
+	llmdInferencePoolStdDevKVCache.Reset()
 	inferencePoolAvgQueueSize.Reset()
 	llmdInferencePoolAvgQueueSize.Reset()
+	llmdInferencePoolStdDevQueueSize.Reset()
 	inferencePoolAvgRunningRequests.Reset()
 	llmdInferencePoolAvgRunningRequests.Reset()
+	llmdInferencePoolStdDevRunningRequests.Reset()
 	inferencePoolReadyPods.Reset()
 	llmdInferencePoolReadyEndpoints.Reset()
 	schedulerE2ELatency.Reset()
@@ -515,6 +539,8 @@ func Reset() {
 	llmdSchedulerAttemptsTotal.Reset()
 	pluginProcessingLatencies.Reset()
 	llmdPluginProcessingLatencies.Reset()
+	llmdRequestProcessingLatency.Reset()
+	llmdResponseProcessingLatency.Reset()
 	inferenceExtensionInfo.Reset()
 	llmdInferenceExtensionInfo.Reset()
 	flowControlRequestQueueDuration.Reset()
@@ -525,8 +551,12 @@ func Reset() {
 	llmdFlowControlQueueBytes.Reset()
 	flowControlPoolSaturation.Reset()
 	llmdFlowControlPoolSaturation.Reset()
+	llmdFlowControlStaleEndpoints.Reset()
 	flowControlRequestEnqueueDuration.Reset()
 	llmdFlowControlRequestEnqueueDuration.Reset()
+	flowControlDispatchCycleDuration.Reset()
+	llmdFlowControlDispatchCycleDuration.Reset()
+	llmdFlowControlRequestsTotal.Reset()
 	inferenceModelRewriteDecisionsTotal.Reset()
 	llmdInferenceModelRewriteDecisionsTotal.Reset()
 	DataLayerPollErrorsTotal.Reset()
@@ -536,28 +566,36 @@ func Reset() {
 }
 
 // RecordRequestCounter records the number of requests.
-func RecordRequestCounter(modelName, targetModelName string, priority int) {
+func RecordRequestCounter(modelName, targetModelName, fairnessID string, priority int) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	prioStr := strconv.Itoa(priority)
 	requestCounter.WithLabelValues(modelName, targetModelName, prioStr).Inc()
-	llmdRequestCounter.WithLabelValues(modelName, targetModelName, prioStr).Inc()
+	llmdRequestCounter.WithLabelValues(modelName, targetModelName, fairnessID, prioStr).Inc()
 }
 
 // RecordRequestErrCounter records the number of error requests.
-func RecordRequestErrCounter(modelName, targetModelName string, code string) {
+func RecordRequestErrCounter(modelName, targetModelName, fairnessID, priority string, code string) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	if code != "" {
 		requestErrCounter.WithLabelValues(modelName, targetModelName, code).Inc()
-		llmdRequestErrCounter.WithLabelValues(modelName, targetModelName, code).Inc()
+		llmdRequestErrCounter.WithLabelValues(modelName, targetModelName, fairnessID, priority, code).Inc()
 	}
 }
 
 // RecordRequestSizes records the request sizes.
-func RecordRequestSizes(modelName, targetModelName string, reqSize int) {
+func RecordRequestSizes(modelName, targetModelName, fairnessID, priority string, reqSize int) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	requestSizes.WithLabelValues(modelName, targetModelName).Observe(float64(reqSize))
-	llmdRequestSizes.WithLabelValues(modelName, targetModelName).Observe(float64(reqSize))
+	llmdRequestSizes.WithLabelValues(modelName, targetModelName, fairnessID, priority).Observe(float64(reqSize))
 }
 
 // RecordRequestLatencies records duration of request.
-func RecordRequestLatencies(ctx context.Context, modelName, targetModelName string, received time.Time, complete time.Time) bool {
+func RecordRequestLatencies(ctx context.Context, modelName, targetModelName, fairnessID, priority string, received time.Time, complete time.Time) bool {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	if !complete.After(received) {
 		log.FromContext(ctx).V(logutil.DEFAULT).Error(nil, "Request latency values are invalid",
 			"modelName", modelName, "targetModelName", targetModelName, "completeTime", complete, "receivedTime", received)
@@ -565,40 +603,50 @@ func RecordRequestLatencies(ctx context.Context, modelName, targetModelName stri
 	}
 	elapsedSeconds := complete.Sub(received).Seconds()
 	requestLatencies.WithLabelValues(modelName, targetModelName).Observe(elapsedSeconds)
-	llmdRequestLatencies.WithLabelValues(modelName, targetModelName).Observe(elapsedSeconds)
+	llmdRequestLatencies.WithLabelValues(modelName, targetModelName, fairnessID, priority).Observe(elapsedSeconds)
 	return true
 }
 
 // RecordResponseSizes records the response sizes.
-func RecordResponseSizes(modelName, targetModelName string, size int) {
+func RecordResponseSizes(modelName, targetModelName, fairnessID, priority string, size int) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	responseSizes.WithLabelValues(modelName, targetModelName).Observe(float64(size))
-	llmdResponseSizes.WithLabelValues(modelName, targetModelName).Observe(float64(size))
+	llmdResponseSizes.WithLabelValues(modelName, targetModelName, fairnessID, priority).Observe(float64(size))
 }
 
 // RecordInputTokens records input tokens count.
-func RecordInputTokens(modelName, targetModelName string, size int) {
+func RecordInputTokens(modelName, targetModelName, fairnessID, priority string, size int) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	if size > 0 {
 		inputTokens.WithLabelValues(modelName, targetModelName).Observe(float64(size))
-		llmdInputTokens.WithLabelValues(modelName, targetModelName).Observe(float64(size))
+		llmdInputTokens.WithLabelValues(modelName, targetModelName, fairnessID, priority).Observe(float64(size))
 	}
 }
 
 // RecordOutputTokens records output tokens count.
-func RecordOutputTokens(modelName, targetModelName string, size int) {
+func RecordOutputTokens(modelName, targetModelName, fairnessID, priority string, size int) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	if size > 0 {
 		outputTokens.WithLabelValues(modelName, targetModelName).Observe(float64(size))
-		llmdOutputTokens.WithLabelValues(modelName, targetModelName).Observe(float64(size))
+		llmdOutputTokens.WithLabelValues(modelName, targetModelName, fairnessID, priority).Observe(float64(size))
 	}
 }
 
 // RecordPromptCachedTokens records prompt cached tokens count.
-func RecordPromptCachedTokens(modelName, targetModelName string, size int) {
+func RecordPromptCachedTokens(modelName, targetModelName, fairnessID, priority string, size int) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	promptCachedTokens.WithLabelValues(modelName, targetModelName).Observe(float64(size))
-	llmdPromptCachedTokens.WithLabelValues(modelName, targetModelName).Observe(float64(size))
+	llmdPromptCachedTokens.WithLabelValues(modelName, targetModelName, fairnessID, priority).Observe(float64(size))
 }
 
 // RecordNormalizedTimePerOutputToken (NTPOT) records the normalized time per output token.
-func RecordNormalizedTimePerOutputToken(ctx context.Context, modelName, targetModelName string, received time.Time, complete time.Time, outputTokenCount int) bool {
+func RecordNormalizedTimePerOutputToken(ctx context.Context, modelName, targetModelName, fairnessID, priority string, received time.Time, complete time.Time, outputTokenCount int) bool {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	if outputTokenCount <= 0 {
 		return false
 	}
@@ -613,23 +661,91 @@ func RecordNormalizedTimePerOutputToken(ctx context.Context, modelName, targetMo
 	secondsPerToken := elapsedSeconds / float64(outputTokenCount)
 
 	normalizedTimePerOutputToken.WithLabelValues(modelName, targetModelName).Observe(secondsPerToken)
-	llmdNormalizedTimePerOutputToken.WithLabelValues(modelName, targetModelName).Observe(secondsPerToken)
+	llmdNormalizedTimePerOutputToken.WithLabelValues(modelName, targetModelName, fairnessID, priority).Observe(secondsPerToken)
+	return true
+}
+
+// RecordRequestTTFT records the time to first token.
+func RecordRequestTTFT(ctx context.Context, modelName, targetModelName, fairnessID, priority string, streaming bool, received time.Time, firstToken time.Time) bool {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
+	if firstToken.IsZero() {
+		return false
+	}
+	if !firstToken.After(received) {
+		log.FromContext(ctx).Error(nil, "Request latency values are invalid for TTFT calculation",
+			"modelName", modelName, "targetModelName", targetModelName, "firstTokenTime", firstToken, "receivedTime", received)
+		return false
+	}
+
+	streamingLabel := "false"
+	if streaming {
+		streamingLabel = "true"
+	}
+	ttftSeconds := firstToken.Sub(received).Seconds()
+	llmdRequestTTFT.WithLabelValues(modelName, targetModelName, fairnessID, priority, streamingLabel).Observe(ttftSeconds)
+	return true
+}
+
+// RecordRequestTPOT records the average time per output token. TPOT is only
+// derivable for streaming responses: a non-streaming response arrives as a
+// single body chunk, so the first-token and completion timestamps coincide and
+// no inter-token timing exists. Such requests are skipped silently instead of
+// being logged as invalid (they would otherwise emit an error-level line per
+// request on non-streaming workloads).
+func RecordRequestTPOT(ctx context.Context, modelName, targetModelName, fairnessID, priority string, streaming bool, received time.Time, firstToken time.Time, complete time.Time, outputTokenCount int) bool {
+	if !streaming {
+		return false
+	}
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
+	if firstToken.IsZero() || outputTokenCount <= 1 {
+		return false
+	}
+	if !firstToken.After(received) || !complete.After(firstToken) {
+		log.FromContext(ctx).Error(nil, "Request latency values are invalid for TPOT calculation",
+			"modelName", modelName, "targetModelName", targetModelName,
+			"receivedTime", received, "firstTokenTime", firstToken, "completeTime", complete)
+		return false
+	}
+
+	e2eSeconds := complete.Sub(received).Seconds()
+	ttftSeconds := firstToken.Sub(received).Seconds()
+	tpotSeconds := (e2eSeconds - ttftSeconds) / float64(outputTokenCount-1)
+	llmdRequestTPOT.WithLabelValues(modelName, targetModelName, fairnessID, priority).Observe(tpotSeconds)
+	return true
+}
+
+// RecordInterTokenLatency records the time between consecutive response body chunks for streaming requests.
+func RecordInterTokenLatency(ctx context.Context, modelName, targetModelName, fairnessID, priority string, itlSeconds float64) bool {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
+	if itlSeconds < 0 {
+		log.FromContext(ctx).Error(nil, "Inter-token latency value must be non-negative",
+			"modelName", modelName, "targetModelName", targetModelName, "itlSeconds", itlSeconds)
+		return false
+	}
+	llmdInterTokenLatency.WithLabelValues(modelName, targetModelName, fairnessID, priority).Observe(itlSeconds)
 	return true
 }
 
 // IncRunningRequests increases the current running requests.
-func IncRunningRequests(modelName string) {
+func IncRunningRequests(modelName, targetModelName, fairnessID, priority string) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	if modelName != "" {
 		runningRequests.WithLabelValues(modelName).Inc()
-		llmdRunningRequests.WithLabelValues(modelName).Inc()
+		llmdRunningRequests.WithLabelValues(modelName, targetModelName, fairnessID, priority).Inc()
 	}
 }
 
 // DecRunningRequests decreases the current running requests.
-func DecRunningRequests(modelName string) {
+func DecRunningRequests(modelName, targetModelName, fairnessID, priority string) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	if modelName != "" {
 		runningRequests.WithLabelValues(modelName).Dec()
-		llmdRunningRequests.WithLabelValues(modelName).Dec()
+		llmdRunningRequests.WithLabelValues(modelName, targetModelName, fairnessID, priority).Dec()
 	}
 }
 
@@ -648,6 +764,18 @@ func RecordInferencePoolAvgRunningRequests(name string, runningRequests float64)
 	llmdInferencePoolAvgRunningRequests.WithLabelValues(name).Set(runningRequests)
 }
 
+func RecordInferencePoolStdDevKVCache(name string, utilization float64) {
+	llmdInferencePoolStdDevKVCache.WithLabelValues(name).Set(utilization)
+}
+
+func RecordInferencePoolStdDevQueueSize(name string, queueSize float64) {
+	llmdInferencePoolStdDevQueueSize.WithLabelValues(name).Set(queueSize)
+}
+
+func RecordInferencePoolStdDevRunningRequests(name string, runningRequests float64) {
+	llmdInferencePoolStdDevRunningRequests.WithLabelValues(name).Set(runningRequests)
+}
+
 func RecordInferencePoolReadyPods(name string, runningPods float64) {
 	inferencePoolReadyPods.WithLabelValues(name).Set(runningPods)
 	llmdInferencePoolReadyEndpoints.WithLabelValues(name).Set(runningPods)
@@ -657,6 +785,18 @@ func RecordInferencePoolReadyPods(name string, runningPods float64) {
 func RecordSchedulerE2ELatency(duration time.Duration) {
 	schedulerE2ELatency.WithLabelValues().Observe(duration.Seconds())
 	llmdSchedulerE2ELatency.WithLabelValues().Observe(duration.Seconds())
+}
+
+// RecordRequestProcessingLatency records the EPP request processing latency,
+// measured from request receipt until the request body has been handled.
+func RecordRequestProcessingLatency(duration time.Duration) {
+	llmdRequestProcessingLatency.WithLabelValues().Observe(duration.Seconds())
+}
+
+// RecordResponseProcessingLatency records the EPP response processing latency
+// for a single request.
+func RecordResponseProcessingLatency(duration time.Duration) {
+	llmdResponseProcessingLatency.WithLabelValues().Observe(duration.Seconds())
 }
 
 // RecordSchedulerAttempt records a scheduling attempt with status and endpoint information.
@@ -675,8 +815,8 @@ func RecordSchedulerAttempt(err error, targetModelName string, result *fwksched.
 			if len(primaryResults.TargetEndpoints) > 0 {
 				metadata := primaryResults.TargetEndpoints[0].GetMetadata()
 				if metadata != nil {
-					schedulerAttemptsTotal.WithLabelValues(SchedulerStatusSuccess, targetModelName, metadata.PodName, metadata.NamespacedName.Namespace, metadata.Port).Inc()
-					llmdSchedulerAttemptsTotal.WithLabelValues(SchedulerStatusSuccess, targetModelName, metadata.PodName, metadata.NamespacedName.Namespace, metadata.Port).Inc()
+					schedulerAttemptsTotal.WithLabelValues(SchedulerStatusSuccess, targetModelName, metadata.Name, metadata.ID.Namespace, metadata.Port).Inc()
+					llmdSchedulerAttemptsTotal.WithLabelValues(SchedulerStatusSuccess, targetModelName, metadata.Name, metadata.ID.Namespace, metadata.Port).Inc()
 					return
 				}
 			}
@@ -710,6 +850,8 @@ func RecordFlowControlRequestQueueDuration(
 	modelName, targetModelName string,
 	duration time.Duration,
 ) {
+	fairnessID = boundFairnessID(fairnessID)
+	modelName, targetModelName = boundModels(modelName, targetModelName)
 	flowControlRequestQueueDuration.WithLabelValues(
 		fairnessID, priority, outcome,
 		inferencePool,
@@ -734,6 +876,7 @@ func RecordFlowControlRequestEnqueueDuration(
 	fairnessID string, priority string, outcome string,
 	duration time.Duration,
 ) {
+	fairnessID = boundFairnessID(fairnessID)
 	flowControlRequestEnqueueDuration.WithLabelValues(
 		fairnessID, priority, outcome,
 	).Observe(duration.Seconds())
@@ -745,24 +888,32 @@ func RecordFlowControlRequestEnqueueDuration(
 
 // IncFlowControlQueueSize increments the Flow Control queue size gauge.
 func IncFlowControlQueueSize(fairnessID, priority, inferencePool, modelName, targetModelName string) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	flowControlQueueSize.WithLabelValues(fairnessID, priority, inferencePool, modelName, targetModelName).Inc()
 	llmdFlowControlQueueSize.WithLabelValues(fairnessID, priority, inferencePool, modelName, targetModelName).Inc()
 }
 
 // DecFlowControlQueueSize decrements the Flow Control queue size gauge.
 func DecFlowControlQueueSize(fairnessID, priority, inferencePool, modelName, targetModelName string) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	flowControlQueueSize.WithLabelValues(fairnessID, priority, inferencePool, modelName, targetModelName).Dec()
 	llmdFlowControlQueueSize.WithLabelValues(fairnessID, priority, inferencePool, modelName, targetModelName).Dec()
 }
 
 // AddFlowControlQueueBytes increments the Flow Control queue bytes gauge.
 func AddFlowControlQueueBytes(fairnessID, priority, inferencePool, modelName, targetModelName string, bytes uint64) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	flowControlQueueBytes.WithLabelValues(fairnessID, priority, inferencePool, modelName, targetModelName).Add(float64(bytes))
 	llmdFlowControlQueueBytes.WithLabelValues(fairnessID, priority, inferencePool, modelName, targetModelName).Add(float64(bytes))
 }
 
 // SubFlowControlQueueBytes decrements the Flow Control queue bytes gauge.
 func SubFlowControlQueueBytes(fairnessID, priority, inferencePool, modelName, targetModelName string, bytes uint64) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	flowControlQueueBytes.WithLabelValues(fairnessID, priority, inferencePool, modelName, targetModelName).Sub(float64(bytes))
 	llmdFlowControlQueueBytes.WithLabelValues(fairnessID, priority, inferencePool, modelName, targetModelName).Sub(float64(bytes))
 }
@@ -773,8 +924,48 @@ func RecordFlowControlPoolSaturation(inferencePool string, saturation float64) {
 	llmdFlowControlPoolSaturation.WithLabelValues(inferencePool).Set(saturation)
 }
 
+// RecordFlowControlStaleEndpoints records how many candidate endpoints the given saturation
+// detector scored as fully saturated because their metrics were missing or stale.
+func RecordFlowControlStaleEndpoints(detector string, count int) {
+	llmdFlowControlStaleEndpoints.WithLabelValues(detector).Set(float64(count))
+}
+
+// IncFlowControlRequestsTotal increments the total request counter for a given outcome.
+func IncFlowControlRequestsTotal(outcome, priority, inferencePool string) {
+	llmdFlowControlRequestsTotal.WithLabelValues(outcome, priority, inferencePool).Inc()
+}
+
+// DeleteFlowControlFlowSeries removes every flow-control series labeled with the given fairness ID
+// and priority, across both the deprecated and the llm_d_epp metric families. The fairness ID is
+// derived from client input, so its cardinality is unbounded; the flow registry calls this when it
+// garbage-collects an idle flow so that the metric vectors track live flows instead of growing
+// monotonically with every fairness ID ever observed.
+//
+// Pruning is not synchronized with recording: a request reviving the flow concurrently with GC can
+// have a queue gauge increment deleted here while its paired decrement lands afterwards, leaving
+// the queue size/bytes gauges negative until the flow's next collection deletes the series again.
+func DeleteFlowControlFlowSeries(fairnessID, priority string) {
+	// The overflow value aggregates every capped-out fairness ID, so a flow whose client-chosen ID
+	// equals it must not delete the shared series.
+	if fairnessID == overflowValue {
+		return
+	}
+	labels := prometheus.Labels{"fairness_id": fairnessID, "priority": priority}
+	flowControlRequestQueueDuration.DeletePartialMatch(labels)
+	flowControlRequestEnqueueDuration.DeletePartialMatch(labels)
+	flowControlQueueSize.DeletePartialMatch(labels)
+	flowControlQueueBytes.DeletePartialMatch(labels)
+	llmdFlowControlRequestQueueDuration.DeletePartialMatch(labels)
+	llmdFlowControlRequestEnqueueDuration.DeletePartialMatch(labels)
+	llmdFlowControlQueueSize.DeletePartialMatch(labels)
+	llmdFlowControlQueueBytes.DeletePartialMatch(labels)
+}
+
 // RecordInferenceModelRewriteDecision records the routing decision for InferenceModelRewrite.
+// The rewrite name and target come from configuration; only the source model name is
+// request-derived and needs bounding (a generic rule matches arbitrary model names).
 func RecordInferenceModelRewriteDecision(modelRewriteName, modelName, targetModel string) {
+	modelName = boundModel(modelName)
 	inferenceModelRewriteDecisionsTotal.WithLabelValues(modelRewriteName, modelName, targetModel).Inc()
 	llmdInferenceModelRewriteDecisionsTotal.WithLabelValues(modelRewriteName, modelName, targetModel).Inc()
 }

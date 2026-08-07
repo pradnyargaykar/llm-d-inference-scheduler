@@ -14,11 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package controller contains the implementation of the FlowController engine.
-//
-// The FlowController is the central processing engine of the Flow Control layer. It is a high-throughput
-// component responsible for managing the lifecycle of all incoming requests. It achieves this by acting as a stateless
-// supervisor that orchestrates a stateful worker (Processor).
 package controller
 
 import (
@@ -46,7 +41,7 @@ type registryClient interface {
 	contracts.FlowRegistryDataPlane
 }
 
-// processor is the minimal internal interface that the FlowController requires from its workers.
+// processor is the minimal internal interface that the FlowController requires from its worker.
 type processor interface {
 	Run(ctx context.Context)
 	Submit(item *internal.FlowItem) error
@@ -57,6 +52,7 @@ type processor interface {
 type processorFactory func(
 	ctx context.Context,
 	registry contracts.FlowRegistry,
+	registryBackground contracts.FlowRegistryBackground,
 	saturationDetector flowcontrol.SaturationDetector,
 	endpointCandidates contracts.EndpointCandidates,
 	usageLimitPolicy flowcontrol.UsageLimitPolicy,
@@ -69,8 +65,8 @@ type processorFactory func(
 var _ processor = &internal.Processor{}
 
 // FlowController is the central, high-throughput engine of the Flow Control layer.
-// It is designed as a stateless distributor that orchestrates a stateful worker (Processor), following a
-// supervisor-worker pattern.
+// It is the request-facing front end that hands each request to a single stateful worker (the Processor) and blocks
+// until the request reaches a terminal outcome.
 //
 // Request Lifecycle Management:
 //
@@ -84,6 +80,8 @@ type FlowController struct {
 
 	config             *Config
 	registry           registryClient
+	flowRegistry       contracts.FlowRegistry
+	registryBackground contracts.FlowRegistryBackground
 	saturationDetector flowcontrol.SaturationDetector
 	endpointCandidates contracts.EndpointCandidates
 	usageLimitPolicy   flowcontrol.UsageLimitPolicy
@@ -120,9 +118,15 @@ func NewFlowController(
 	if deps.Clock == nil {
 		deps.Clock = clock.RealClock{}
 	}
+	var registryBackground contracts.FlowRegistryBackground
+	if bg, ok := deps.Registry.(contracts.FlowRegistryBackground); ok {
+		registryBackground = bg
+	}
 	fc := &FlowController{
 		config:             config,
 		registry:           deps.Registry,
+		flowRegistry:       deps.Registry,
+		registryBackground: registryBackground,
 		saturationDetector: deps.SaturationDetector,
 		endpointCandidates: deps.EndpointCandidates,
 		usageLimitPolicy:   deps.UsageLimitPolicy,
@@ -135,6 +139,7 @@ func NewFlowController(
 		fc.processorFactory = func(
 			ctx context.Context,
 			registry contracts.FlowRegistry,
+			registryBackground contracts.FlowRegistryBackground,
 			saturationDetector flowcontrol.SaturationDetector,
 			endpointCandidates contracts.EndpointCandidates,
 			usageLimitPolicy flowcontrol.UsageLimitPolicy,
@@ -147,6 +152,7 @@ func NewFlowController(
 				ctx,
 				poolName,
 				registry,
+				registryBackground,
 				saturationDetector,
 				endpointCandidates,
 				usageLimitPolicy,
@@ -163,7 +169,8 @@ func NewFlowController(
 	// Construct a new worker, but do not start its goroutine yet.
 	fc.processor = fc.processorFactory(
 		fc.parentCtx,
-		fc.registry,
+		fc.flowRegistry,
+		fc.registryBackground,
 		fc.saturationDetector,
 		fc.endpointCandidates,
 		fc.usageLimitPolicy,
@@ -227,7 +234,7 @@ func (fc *FlowController) EnqueueAndWait(
 
 	// 2. Acquire a lease for the Flow.
 	// We hold this lease for the entire duration of the request (Distribution + Queueing).
-	err := fc.registry.WithConnection(flowKey, func(conn contracts.ActiveFlowConnection) error {
+	err := fc.withConnectionWithFallback(req, func(conn contracts.ActiveFlowConnection, effectiveReq flowcontrol.FlowControlRequest) error {
 
 		select { // Non-blocking check on controller lifecycle.
 		case <-fc.parentCtx.Done():
@@ -237,7 +244,9 @@ func (fc *FlowController) EnqueueAndWait(
 		}
 
 		// Attempt to distribute the request once, passing the active connection.
-		item, err := fc.tryDistribution(reqCtx, req, enqueueTime, conn)
+		// effectiveReq carries the fallback flow key when the requested band was not provisioned, so the
+		// item is enqueued under the band that was actually leased.
+		item, err := fc.tryDistribution(reqCtx, effectiveReq, enqueueTime, conn)
 		if err != nil {
 			// Distribution failed terminally (e.g., context cancelled during blocking submit).
 			// The item has already been finalized by tryDistribution.
@@ -260,13 +269,67 @@ func (fc *FlowController) EnqueueAndWait(
 	// return a valid rejection outcome.
 	// In the success case (where the closure ran), finalOutcome is set inside the closure.
 	if err != nil && finalOutcome == types.QueueOutcomeNotYetFinalized {
-		return types.QueueOutcomeRejectedOther, fmt.Errorf("%w: %w", types.ErrRejected, err)
+		finalOutcome = types.QueueOutcomeRejectedOther
+		err = fmt.Errorf("%w: %w", types.ErrRejected, err)
 	}
+
+	if finalOutcome != types.QueueOutcomeDispatched {
+		fc.logger.V(logutil.VERBOSE).Info("Request dropped",
+			"requestID", req.ID(), "flowKey", flowKey, "outcome", finalOutcome, "err", err)
+	}
+
+	metrics.IncFlowControlRequestsTotal(finalOutcome.String(), priority, req.InferencePoolName())
 
 	return finalOutcome, err
 }
 
-// tryDistribution handles a single attempt to select a shard and submit a request.
+// fallbackRequest wraps a FlowControlRequest to override its flow key, so a request that falls back to a different
+// priority is enqueued under the band that was actually leased rather than its original (unprovisioned) band.
+//
+// Trade-off: downstream consumers see this wrapper, so item.OriginalRequest().FlowKey() reports the fallback
+// priority rather than the requested one — despite the method name. This is intentional, since the item must be
+// leased, distributed, and enqueued consistently at the fallback priority. The originally requested priority
+// therefore survives only in the withConnectionWithFallback log; surfacing it in metrics is left as a follow-up
+// (a dedicated fallback counter labeled with the original priority).
+type fallbackRequest struct {
+	flowcontrol.FlowControlRequest
+	key flowcontrol.FlowKey
+}
+
+func (r fallbackRequest) FlowKey() flowcontrol.FlowKey { return r.key }
+
+// withConnectionWithFallback acquires a flow connection, falling back to priority 0 when the requested band is not yet
+// provisioned. On fallback, the callback receives a request whose FlowKey reports priority 0, ensuring the item is
+// leased, distributed, and enqueued consistently under priority 0; otherwise it receives the original request.
+//
+// Note: relative to the requested priority this is a demotion for positive priorities but a promotion for negative
+// ones. It is an availability-first fallback for the brief window before the control plane provisions the band.
+func (fc *FlowController) withConnectionWithFallback(
+	req flowcontrol.FlowControlRequest,
+	fn func(conn contracts.ActiveFlowConnection, effectiveReq flowcontrol.FlowControlRequest) error,
+) error {
+	key := req.FlowKey()
+	err := fc.registry.WithConnection(key, func(conn contracts.ActiveFlowConnection) error {
+		return fn(conn, req)
+	})
+	if err == nil || !errors.Is(err, contracts.ErrPriorityBandNotFound) || key.Priority == 0 {
+		return err
+	}
+
+	fc.logger.V(logutil.DEFAULT).Info(
+		"Priority band not provisioned, falling back to priority 0",
+		"originalPriority", key.Priority,
+		"flowID", key.ID,
+	)
+	fallbackKey := key
+	fallbackKey.Priority = 0
+	fallback := fallbackRequest{FlowControlRequest: req, key: fallbackKey}
+	return fc.registry.WithConnection(fallbackKey, func(conn contracts.ActiveFlowConnection) error {
+		return fn(conn, fallback)
+	})
+}
+
+// tryDistribution handles a single attempt to submit a request to the processor.
 // It uses the provided `conn` to access the registry data plane.
 // If this function returns an error, it guarantees that the provided `item` has been finalized.
 func (fc *FlowController) tryDistribution(
@@ -292,7 +355,13 @@ func (fc *FlowController) tryDistribution(
 		fc.logger.Error(err,
 			"Invariant violation. Failed to get ManagedQueue for a leased flow.",
 			"flowKey", conn.FlowKey())
-		item.FinalizeWithOutcome(types.QueueOutcomeRejectedCapacity, types.ErrRejected)
+		// An internal invariant violation, not a capacity condition: finalize as RejectedOther so it
+		// surfaces as an internal error rather than as saturation backpressure. The registry error is
+		// flattened with %v because this finalized error is returned through the connection closure in
+		// EnqueueAndWait: a %w-preserved ErrPriorityBandNotFound would be misread by
+		// withConnectionWithFallback as a lease-acquisition failure and silently retried at priority 0.
+		item.FinalizeWithOutcome(types.QueueOutcomeRejectedOther,
+			fmt.Errorf("%w: failed to get ManagedQueue for leased flow: %v", types.ErrRejected, err))
 		return item, err
 	}
 
@@ -315,8 +384,15 @@ func (fc *FlowController) tryDistribution(
 	return item, finalErr
 }
 
+func finalizeOnControllerShutdown(item *internal.FlowItem) (types.QueueOutcome, error) {
+	item.Finalize(types.ErrFlowControllerNotRunning)
+
+	finalState := item.FinalState()
+	return finalState.Outcome, finalState.Err
+}
+
 // awaitFinalization blocks until an item is finalized, either by the processor (synchronously) or by the controller
-// itself due to context expiry (asynchronously).
+// itself due to context expiry or shutdown (asynchronously).
 func (fc *FlowController) awaitFinalization(
 	reqCtx context.Context,
 	item *internal.FlowItem,
@@ -325,12 +401,19 @@ func (fc *FlowController) awaitFinalization(
 	case <-reqCtx.Done():
 		// Asynchronous Finalization (Controller-initiated):
 		// The request Context expired (Cancellation/TTL) while the item was being processed.
+		if fc.parentCtx.Err() != nil {
+			return finalizeOnControllerShutdown(item)
+		}
+
 		cause := context.Cause(reqCtx)
 		item.Finalize(cause)
 
 		// The processor will eventually discard this "zombie" item during its cleanup sweep.
 		finalState := item.FinalState()
 		return finalState.Outcome, finalState.Err
+
+	case <-fc.parentCtx.Done():
+		return finalizeOnControllerShutdown(item)
 
 	case finalState := <-item.Done():
 		// Synchronous Finalization (Processor-initiated):
@@ -358,21 +441,19 @@ func (fc *FlowController) createRequestContext(
 	return reqCtx, cancel, enqueueTime
 }
 
-// distributeRequest implements a flow-aware, two-phase "Join-Shortest-Queue-by-Bytes" (JSQ-Bytes) distribution strategy
-// with graceful backpressure. It attempts to submit an item to the best-ranked candidate from the provided list.
+// distributeRequest submits an item to the processor with graceful backpressure.
 //
-// The algorithm operates as follows:
-//  1. Phase 1 (Non-blocking Fast Failover): It iterates through the ranked candidates and attempts a non-blocking
-//     submission. The first successful submission wins.
-//  2. Phase 2 (Blocking Fallback): If all non-blocking attempts fail, it performs a single blocking submission to the
-//     least-loaded candidate, providing backpressure.
+// It operates in two phases:
+//  1. Non-blocking submit: a fast Submit that succeeds immediately if the processor's enqueue channel has capacity.
+//  2. Blocking fallback: if the processor is busy, a single blocking SubmitOrBlock that applies backpressure until the
+//     item is accepted, the context expires, or the processor shuts down.
 //
 // The provided context (ctx) is used for the blocking submission phase (SubmitOrBlock).
 //
 // Ownership Contract:
-//   - Returns nil: Success. Ownership transferred to Processor.
-//   - Returns error: Failure (Context expiry, shutdown,, etc.).
-//     Ownership retained by Controller. The Controller MUST finalize the item.
+//   - Returns nil: Success. Ownership transferred to the Processor.
+//   - Returns error: Failure (context expiry, shutdown, etc.).
+//     Ownership retained by the Controller, which MUST finalize the item.
 func (fc *FlowController) distributeRequest(
 	ctx context.Context,
 	item *internal.FlowItem,
@@ -383,7 +464,7 @@ func (fc *FlowController) distributeRequest(
 	}
 
 	// processor is busy. Attempt a single blocking submission to the candidate.
-	fc.logger.V(logutil.TRACE).Info("Processor is busy, attempting blocking submit", "requestID", reqID)
+	fc.logger.V(logutil.DEBUG).Info("Processor is busy, attempting blocking submit", "requestID", reqID)
 	err := fc.processor.SubmitOrBlock(ctx, item)
 	if err != nil {
 		return types.QueueOutcomeRejectedOther, fmt.Errorf("%w: request not accepted: %w", types.ErrRejected, err)

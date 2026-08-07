@@ -11,11 +11,13 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
-	"github.com/llm-d/llm-d-router/pkg/telemetry"
+	mmobs "github.com/llm-d/llm-d-router/pkg/epp/framework/observability/multimodal"
+	schedplugins "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling"
 )
 
 const (
@@ -87,8 +89,8 @@ func (p *HeadersHandler) WithName(name string) *HeadersHandler {
 
 // PreRequest wires prefill and encode SchedulerProfile results into headers to indicate disaggregation workers.
 func (p *HeadersHandler) PreRequest(ctx context.Context, request *scheduling.InferenceRequest, schedulingResult *scheduling.SchedulingResult) {
-	tracer := telemetry.Tracer()
-	_, span := tracer.Start(ctx, "llm_d.epp.prerequest.disaggregation",
+	tracer := tracing.Tracer(schedplugins.TracerScope)
+	_, span := tracer.Start(ctx, "prepare_disaggregation",
 		trace.WithSpanKind(trace.SpanKindInternal),
 	)
 	defer span.End()
@@ -114,6 +116,7 @@ func (p *HeadersHandler) PreRequest(ctx context.Context, request *scheduling.Inf
 		span.SetAttributes(attribute.String("gen_ai.request.model", request.TargetModel))
 	}
 	span.SetAttributes(attribute.String("gen_ai.request.id", request.RequestID))
+	span.SetAttributes(mmobs.SpanAttributes(request)...)
 
 	// Prefill header
 	delete(request.Headers, routing.PrefillEndpointHeader) // clear header, if already set

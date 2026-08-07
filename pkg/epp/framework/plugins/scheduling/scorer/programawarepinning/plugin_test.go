@@ -21,8 +21,8 @@ func TestProgramAwarePinningScorer(t *testing.T) {
 		t.Fatalf("unexpected plugin type: %s", p.TypedName().Type)
 	}
 
-	podA := scheduling.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Namespace: "default", Name: "pod-a"}}, nil, nil)
-	podB := scheduling.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Namespace: "default", Name: "pod-b"}}, nil, nil)
+	podA := scheduling.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Namespace: "default", Name: "pod-a"}}, nil, nil)
+	podB := scheduling.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Namespace: "default", Name: "pod-b"}}, nil, nil)
 	pods := []scheduling.Endpoint{podA, podB}
 
 	req1 := &scheduling.InferenceRequest{FairnessID: "prog1"}

@@ -275,16 +275,18 @@ plugins:
         - key: "role"
           operator: In
           values: ["decode"]
-  - type: prefix-cache-scorer
+  - type: approx-prefix-cache-producer
     parameters:
       autoTune: false
       blockSizeTokens: 5
-      maxPrefixBlocksToMatch: 256
+      maxPrefixTokensToMatch: 1280
       lruCapacityPerServer: 31250
+  - type: prefix-cache-scorer
   - type: max-score-picker
   - type: prefix-based-pd-decider
     parameters:
       nonCachedTokens: 8
+      promptTokens: 0
   - type: disagg-profile-handler
     parameters:
       profiles:
@@ -337,17 +339,19 @@ plugins:
         - key: "role"
           operator: In
           values: ["decode"]
-  - type: prefix-cache-scorer
+  - type: approx-prefix-cache-producer
     parameters:
       autoTune: false
       blockSizeTokens: 5
-      maxPrefixBlocksToMatch: 256
+      maxPrefixTokensToMatch: 1280
       lruCapacityPerServer: 31250
+  - type: prefix-cache-scorer
   - type: max-score-picker
   - type: always-disagg-multimodal-decider
   - type: prefix-based-pd-decider
     parameters:
       nonCachedTokens: 8
+      promptTokens: 0
   - type: disagg-profile-handler
     parameters:
       profiles:
@@ -397,21 +401,27 @@ The `prefix-based-pd-decider` plugin makes the disaggregation decision according
 **How It Works**
 - Once a decode pod is selected, the decider checks how many tokens from the incoming prompt have already been sent to this pod
 
-- If the remaining non-cached suffix length is longer than the configured threshold (nonCachedTokens), disaggregation is triggered – the prefill will run remotely on a prefill pod, and decode locally on the decode pod
+- If the prompt length is shorter than the configured prompt length threshold (promptTokens), the full request runs locally on the decode worker without remote prefill
 
-- If the non-cached suffix is shorter or equal to the threshold, the full request runs locally on the decode worker without remote prefill
+- If the remaining non-cached suffix length is at least the configured threshold (nonCachedTokens), disaggregation is triggered: the prefill will run remotely on a prefill pod, and decode locally on the decode pod
+
+- If the non-cached suffix is shorter than the threshold, the full request runs locally on the decode worker without remote prefill
 
 **Configuration**
 ```yaml
 - type: prefix-based-pd-decider
   parameters:
     nonCachedTokens: 8
+    promptTokens: 0
 ```
 
 **Parameter:**
 
 - `nonCachedTokens`: Number of non-cached tokens that trigger disaggregation
   - If set to 0, disaggregation never occurs for any request
+- `promptTokens`: Minimum prompt length in tokens before prefix-cache-based disaggregation logic is applied
+  - If set to 0, the prompt-length gate is disabled
+  - If set to a positive value, requests with fewer prompt tokens run locally on the decode worker without remote prefill
 
 #### Always-Disagg PD Decider
 The `always-disagg-pd-decider` is a simpler alternative used mainly for testing or benchmarking.
@@ -515,9 +525,140 @@ Custom profile names (if your scheduling profiles are not named `decode`/`prefil
 
 ---
 
+## Sidecar Configuration
+
+The decode sidecar proxy is responsible for coordinating KV cache transfers between vLLM instances during disaggregated inference. It must be configured with the correct connector protocol matching the vLLM `kv_connector` used on the serving pods.
+
+### KV Connector (`--kv-connector`)
+
+Specifies which KV transfer protocol the sidecar uses to coordinate prefill/decode disaggregation. This flag corresponds to the vLLM-side `kv_connector` value set in `--kv-transfer-config` on the serving pods, but uses its own naming convention.
+
+| `--kv-connector` value | vLLM `kv_connector` | Description |
+|---|---|---|
+| `nixlv2` (default) | `NixlConnector` | NIXL-based KV transfer using RDMA/GPU-direct |
+| `shared-storage` | `SharedStorageConnector` | KV transfer via shared filesystem |
+| `sglang` | — | SGLang disaggregation protocol |
+| `mooncake` | `MooncakeConnector` | [Mooncake](https://github.com/kvcache-ai/Mooncake) KV transfer using RDMA |
+| `offloading` | `OffloadingConnector` | KV transfer over the vLLM CPU offloading tier. The decoder pulls KV from the prefiller via the `p2p` secondary tier. |
+
+With `offloading`, the sidecar dispatches prefill and decode concurrently. It
+injects role-keyed `kv_transfer_params`, each key named for the remote party it
+describes: the prefiller receives `{"remote_decoder": {"kv_request_id": <id>}}`
+(no peer address), and the decoder receives `{"remote_prefiller":
+{"kv_request_id": <id>, "remote_host": <prefiller host>, "remote_port":
+<p2p-connector-port>}}` so it can pull KV from the prefiller. The prefiller host
+comes from the `x-prefiller-host-port` header; the port is
+`--p2p-connector-port`.
+
+When the request also carries the `x-kv-cache-source-host-port` header (set by
+the EPP `p2p-source-producer` to a peer holding more cached prefix than the pod
+computing the prefix), the sidecar injects an additional `remote_kv_source` key
+so vLLM pulls that cached prefix over the P2P tier instead of recomputing it.
+Under disaggregation the prefiller leg carries `{"remote_decoder": {...},
+"remote_kv_source": {"kv_request_id": <own id>, "remote_host": <source host>,
+"remote_port": <p2p-connector-port>}}` (the only supported multi-key
+combination); without a prefiller the decoder-only request carries
+`{"remote_kv_source": {...}}` alone. A malformed or disallowed source header is
+ignored and the request proceeds unchanged, as is any source header on a
+connector that cannot pull over the P2P tier: only `offloading`, or NIXLv2 with
+`--enable-p2p-pull`, honors it. For the pulled blocks to be servable, the source
+pod must offload its generated (decode-phase) KV: set `offload_prompt_only:
+false` in its `kv_connector_extra_config` (the default `true` offloads only
+prefill blocks).
+
+Both prefill and decode pods require the following `--kv-transfer-config`:
+
+```json
+{
+  "kv_connector": "OffloadingConnector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+    "spec_name": "TieringOffloadingSpec",
+    "cpu_bytes_to_use": <bytes>,
+    "secondary_tiers": [{"type": "p2p", "host": "<POD_IP>", "port": <p2p-connector-port>}]
+  }
+}
+```
+
+`host` must be the pod's own IP at runtime (use the Kubernetes downward API env var `status.podIP`). `port` must match `--p2p-connector-port` (default `7777`) when each pod is a complete DP group; wide-EP worker pods instead set the compensated `P2P_BASE` (see the wide-EP paragraph below). `cpu_bytes_to_use` controls the CPU KV offload buffer size; size it to hold the KV for the expected concurrent in-flight transfers. `OffloadingConnector` is available in vLLM nightly builds from 2026-06-30 onward (commit `bec232a`, [PR #42285](https://github.com/vllm-project/vllm/pull/42285)).
+
+**Data parallelism:** the P2P tier supports `--data-parallel-size` N > 1 when
+each pod is a complete DP group (the per-pod DP deployment), or a multi-pod
+(wide-EP) group with compensated socket bases (below).
+
+- vLLM gives each DP replica its own P2P listener and offload region:
+  replica `i` serves on `<p2p-connector-port>+i`, where `i` is the
+  **global** `data_parallel_index`
+  ([PR #47636](https://github.com/vllm-project/vllm/pull/47636),
+  [PR #47987](https://github.com/vllm-project/vllm/pull/47987)). Engines
+  without those changes bind every replica to the same
+  `POD_IP:<p2p-connector-port>`, and DP > 1 fails at engine startup.
+- The sidecar serves rank `r` on its own port + `r`, so the routed
+  endpoint's port names the target rank. The sidecar injects
+  `remote_port` = `--p2p-connector-port` + `r`; a port outside the rank
+  range falls back to rank 0.
+- The endpoint port encodes the pod-local rank, which matches the global
+  index only when the pod is a whole DP group. Multi-pod DP groups (for
+  example LWS wide-EP, where pod `k`'s replicas hold global indices
+  `k*N..k*N+N-1` behind the same serving ports) must compensate the
+  configured socket base ports per pod; see the wide-EP example below.
+- Every replica maps its own offload region, so the pod's `/dev/shm` must
+  exceed N x `cpu_bytes_to_use`.
+
+**Wide-EP (multi-pod DP groups):** vLLM adds the **global**
+`data_parallel_index` to the configured P2P and KV-events base ports, while
+the router addresses an engine by pod IP plus **pod-local** rank. Each pod
+must therefore subtract its global start rank from both configured bases so
+every pod binds the same pod-local ranges and the serving-port offset again
+names the target rank. In an LWS template with `DP_SIZE_LOCAL` ranks per
+pod:
+
+```bash
+START_RANK=$(( ${LWS_WORKER_INDEX:-0} * DP_SIZE_LOCAL ))
+P2P_BASE=$((7777 - START_RANK))
+KV_EVENTS_BASE=$((5557 - START_RANK))
+```
+
+`P2P_BASE` is the P2P secondary tier port:
+
+```json
+"secondary_tiers": [{"type": "p2p", "host": "${POD_IP}", "port": ${P2P_BASE}}]
+```
+
+`KV_EVENTS_BASE` is the KV-events publisher endpoint
+(`"endpoint": "tcp://*:${KV_EVENTS_BASE}"`), so the EPP's per-rank
+subscribers (`precise-prefix-cache-producer` dials
+`podDiscoveryConfig.socketPort` + rank index) reach each rank's socket.
+With `DP_SIZE_LOCAL: 8` every pod binds P2P `7777-7784`, KV events
+`5557-5564`, and serving `8000-8007`. Only the socket bases are
+compensated; `data_parallel_index` and the global rank carried in KV-event
+batches are unchanged.
+
+### General Sidecar Flags
+
+| Flag | Env var | Values | Default | Description |
+|---|---|---|---|---|
+| `--enable-tls` | — | `prefiller`, `decoder`, `encoder` (comma-separated or repeated) | none | Enable TLS for the specified stages. Example: `--enable-tls=prefiller,decoder` |
+| `--tls-insecure-skip-verify` | — | `prefiller`, `decoder`, `encoder` (comma-separated or repeated) | none | Skip TLS certificate verification for the specified stages. Example: `--tls-insecure-skip-verify=prefiller` |
+| `--enable-prefiller-sampling` | `ENABLE_PREFILLER_SAMPLING` | `true` / `false` | `false` | If true, the prefill instance is selected randomly from the provided prefill host values. |
+| `--enable-ssrf-protection` | — | `true` / `false` | `false` | Enable SSRF protection using InferencePool allowlisting. |
+
+### Connector-Specific Flags
+
+| Connector | Flag | Env var | Default | Description |
+|---|---|---|---|---|
+| `mooncake` | `--mooncake-bootstrap-port` | `MOONCAKE_BOOTSTRAP_PORT` | `8998` | Port used to query the Mooncake bootstrap endpoint on prefill pods. Corresponds to vLLM's `VLLM_MOONCAKE_BOOTSTRAP_PORT`. |
+| `sglang` | — | `SGLANG_BOOTSTRAP_PORT` | `8998` | Port used for the SGLang bootstrap endpoint on prefill pods. |
+| `offloading` | `--p2p-connector-port` | `P2P_CONNECTOR_PORT` | `7777` | Prefiller's OffloadingConnector P2P tier listening port (rank-0 port under data parallelism), injected as `remote_port` on the decode leg so the decoder can pull KV. |
+| `nixlv2` | `--enable-p2p-pull` | — | `false` | Declare the OffloadingConnector P2P tier available for cached-prefix pulls when the PD connector is NIXLv2, i.e. the engines run `MultiConnector(NixlConnector + OffloadingConnector)`. NIXL moves KV prefill to decode while the OffloadingConnector pulls the cached prefix named by `x-kv-cache-source-host-port`. Rejected at startup with any other connector; `offloading` provides the tier natively and needs no flag. |
+
+---
+
 ## References
 - vLLM: [Disaggregated Prefill](https://docs.vllm.ai/en/latest/features/disagg_prefill/)
 - vLLM: [Encode Prefill Decode Disaggregation Design](https://docs.google.com/document/d/1aed8KtC6XkXtdoV87pWT0a8OJlZ-CpnuLLzmR8l9BAE/edit?tab=t.0#heading=h.9xkkijtnbbje)
 - vLLM: [Disaggregated Encoder](https://docs.vllm.ai/en/latest/features/disagg_encoder/)
 - vLLM: [[RFC]: Prototype Separating Vision Encoder to Its Own Worker](https://github.com/vllm-project/vllm/issues/20799)
 - vLLM: [Encoder Disaggregation for Scalable Multimodal Model Serving](https://vllm.ai/blog/vllm-epd)
+- Mooncake: [MooncakeConnector Usage Guide](https://github.com/vllm-project/vllm/blob/main/docs/features/mooncake_connector_usage.md)
+- vLLM: [OffloadingConnector / P2P secondary tier (PR #42285)](https://github.com/vllm-project/vllm/pull/42285)

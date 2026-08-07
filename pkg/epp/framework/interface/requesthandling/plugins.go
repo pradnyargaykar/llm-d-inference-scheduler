@@ -24,6 +24,11 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 )
 
+const (
+	RequestParsingExtensionPoint  = "RequestParsing"
+	ResponseParsingExtensionPoint = "ResponseParsing"
+)
+
 // Parser defines the interface for parsing payload(requests and responses).
 type Parser interface {
 	fwkplugin.Plugin
@@ -45,6 +50,13 @@ type Parser interface {
 
 	// Claims returns the paths and protocols claimed by this parser.
 	Claims() Claims
+}
+
+// ModelNameRewriter is implemented by parsers whose forwarded body can carry a model name.
+type ModelNameRewriter interface {
+	// RewriteModelName writes model into the payload and returns it. Taking and
+	// returning a MarshalablePayload guarantees the result is repackageable.
+	RewriteModelName(payload MarshalablePayload, model string) (MarshalablePayload, error)
 }
 
 // Claims defines the matching criteria for a parser.

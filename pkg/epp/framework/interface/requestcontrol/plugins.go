@@ -18,6 +18,7 @@ package requestcontrol
 
 import (
 	"context"
+	"time"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
@@ -25,12 +26,23 @@ import (
 )
 
 const (
-	PreAdmissionExtensionPoint      = "PreAdmission"
+	RequestHeaderExtensionPoint     = "RequestHeader"
+	ScreenerExtensionPoint          = "Screener"
+	AdmissionExtensionPoint         = "Admission"
+	DataProducerExtensionPoint      = "DataProducer"
 	PreRequestExtensionPoint        = "PreRequest"
 	ResponseReceivedExtensionPoint  = "ResponseReceived"
 	ResponseStreamingExtensionPoint = "ResponseStreaming"
 	ResponseCompleteExtensionPoint  = "ResponseComplete"
 )
+
+// Screener performs preliminary filtering of located endpoints before data
+// production, admission, and scheduling profiles run. Every screener sees the
+// same input set, and the framework intersects their results.
+type Screener interface {
+	plugin.Plugin
+	Screen(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) []fwksched.Endpoint
+}
 
 // PreRequest is called by the director after a getting result from scheduling layer and
 // before a request is sent to the selected model server.
@@ -72,6 +84,13 @@ type DataProducer interface {
 	Produce(ctx context.Context, request *fwksched.InferenceRequest, pods []fwksched.Endpoint) error
 }
 
+// TimeoutAwareProducer is an optional interface a DataProducer may implement to
+// declare its own execution timeout, overriding the default. A non-positive
+// value selects the default.
+type TimeoutAwareProducer interface {
+	ProduceTimeout() time.Duration
+}
+
 // Admitter is called by the director after the data producer and before scheduling.
 // When a request has to go through multiple Admitter,
 // the request is admitted only if all plugins say that the request should be admitted.
@@ -82,9 +101,10 @@ type Admitter interface {
 	Admit(ctx context.Context, request *fwksched.InferenceRequest, pods []fwksched.Endpoint) error
 }
 
-// PreAdmitter runs after InferenceRequest creation but before admission control.
-// It can mutate InferenceRequest fields such as FairnessID and Headers.
-type PreAdmitter interface {
+// RequestHeaderProcessor runs after InferenceRequest creation but before admission control.
+// It processes request metadata (headers, path, method) to attach attributes to the request
+// via request.PutAttribute().
+type RequestHeaderProcessor interface {
 	plugin.Plugin
-	PreAdmit(ctx context.Context, request *fwksched.InferenceRequest) error
+	RequestHeader(ctx context.Context, request *fwksched.InferenceRequest) error
 }

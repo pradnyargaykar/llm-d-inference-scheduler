@@ -33,6 +33,7 @@ const (
 var _ scheduling.Scorer = &NoHitLRU{}
 var _ requestcontrol.PreRequest = &NoHitLRU{}
 var _ plugin.ConsumerPlugin = &NoHitLRU{}
+var _ plugin.StateDumper = &NoHitLRU{}
 
 // Parameters defines the parameters for the NoHitLRU scorer.
 type Parameters struct {
@@ -122,6 +123,40 @@ func (s *NoHitLRU) Category() scheduling.ScorerCategory {
 	return scheduling.Distribution
 }
 
+const maxDebugDumpEndpoints = 100
+
+// noHitLRUState is the sanitized snapshot returned by DumpState: the endpoint
+// identities tracked in the cold-request LRU, nothing else. The dump is partial
+// when TotalEndpoints exceeds MaxEndpoints.
+type noHitLRUState struct {
+	Endpoints      []string `json:"endpoints"`
+	TotalEndpoints int      `json:"totalEndpoints"`
+	MaxEndpoints   int      `json:"maxEndpoints"`
+}
+
+// DumpState reports the endpoints currently tracked in the cold-request LRU,
+// ordered least-recently-used first (the order the scorer favors for the next
+// cold request) and capped to maxDebugDumpEndpoints so the payload stays bounded.
+// No extra lock is needed: lru.Cache is internally synchronized, so Keys() is
+// safe to call concurrently with PreRequest's Add().
+func (s *NoHitLRU) DumpState() (json.RawMessage, error) {
+	state := noHitLRUState{MaxEndpoints: maxDebugDumpEndpoints}
+	// A constructed scorer always has a cache; this guards zero-value use.
+	if s.lruCache == nil {
+		return json.Marshal(state)
+	}
+
+	// Keys returns a fresh slice, least-recently-used first, safe to truncate.
+	// https://pkg.go.dev/github.com/hashicorp/golang-lru/v2#Cache.Keys
+	keys := s.lruCache.Keys()
+	state.TotalEndpoints = len(keys)
+	if len(keys) > maxDebugDumpEndpoints {
+		keys = keys[:maxDebugDumpEndpoints]
+	}
+	state.Endpoints = keys
+	return json.Marshal(state)
+}
+
 func (s *NoHitLRU) Consumes() plugin.DataDependencies {
 	return plugin.DataDependencies{
 		Required: map[plugin.DataKey]any{s.dk: attrprefix.PrefixCacheMatchInfo{}},
@@ -140,7 +175,7 @@ func (s *NoHitLRU) isColdRequest(ctx context.Context, endpoints []scheduling.End
 		}
 		info, ok := attr.(*attrprefix.PrefixCacheMatchInfo)
 		if ok && info.MatchBlocks() > 0 {
-			logger.Info("Cache hit detected on endpoint", "endpoint", ep.GetMetadata().NamespacedName)
+			logger.Info("Cache hit detected on endpoint", "endpoint", ep.GetMetadata().ID)
 			return false
 		}
 	}
@@ -175,7 +210,7 @@ func (s *NoHitLRU) getLRUPositions() map[string]int {
 // (usedPods) and those that have never received cold requests (neverUsedPods).
 func (s *NoHitLRU) partitionPodsByUsage(endpoints []scheduling.Endpoint, lruPosition map[string]int) (usedEndpoints, neverUsedEndpoints []scheduling.Endpoint) {
 	for _, endpoint := range endpoints {
-		endpointName := endpoint.GetMetadata().NamespacedName.String()
+		endpointName := endpoint.GetMetadata().ID.String()
 		if _, exists := lruPosition[endpointName]; exists {
 			usedEndpoints = append(usedEndpoints, endpoint)
 		} else {
@@ -207,7 +242,7 @@ func (s *NoHitLRU) scoreUsedPods(scoredEndpoints map[scheduling.Endpoint]float64
 		return
 	}
 	for _, endpoint := range usedPods {
-		endpointName := endpoint.GetMetadata().NamespacedName.String()
+		endpointName := endpoint.GetMetadata().ID.String()
 		lruPos := lruPosition[endpointName]
 		// LRU keys are oldest to newest so rank 0 = oldest
 		// The never used endpoint count is added to the rank so that
@@ -304,7 +339,7 @@ func (s *NoHitLRU) moveTargetPodToFront(ctx context.Context, request *scheduling
 	logger := log.FromContext(ctx).V(logging.DEBUG)
 
 	targetPod := targetProfile.TargetEndpoints[0]
-	endpointName := targetPod.GetMetadata().NamespacedName.String()
+	endpointName := targetPod.GetMetadata().ID.String()
 
 	// Move the endpoint to the front of the LRU.
 	var present struct{} // dummy value

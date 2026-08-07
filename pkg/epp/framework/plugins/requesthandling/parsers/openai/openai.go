@@ -39,6 +39,8 @@ const (
 	chatCompletionsAPI = "chat/completions"
 	completionsAPI     = "completions"
 	embeddingsAPI      = "embeddings"
+	// imagesGenerationsAPI is the OpenAI-compatible image generation endpoint/
+	imagesGenerationsAPI = "images/generations"
 
 	streamingRespPrefix = "data: "
 	streamingEndMsg     = "data: [DONE]"
@@ -48,7 +50,6 @@ const (
 	// to account for optional parameters like "; charset=utf-8" often appended by proxies.
 	eventStreamType = "text/event-stream"
 
-	usageField               = "usage"
 	promptTokensField        = "prompt_tokens"
 	inputTokensField         = "input_tokens"
 	completionTokensField    = "completion_tokens"
@@ -60,7 +61,10 @@ const (
 )
 
 // compile-time type validation
-var _ fwkrh.Parser = &OpenAIParser{}
+var (
+	_ fwkrh.Parser            = &OpenAIParser{}
+	_ fwkrh.ModelNameRewriter = &OpenAIParser{}
+)
 
 // OpenAIParser implements the fwkrh.Parser interface for OpenAI API
 // https://developers.openai.com/api/reference/overview
@@ -91,6 +95,9 @@ func (p *OpenAIParser) Claims() fwkrh.Claims {
 			embeddingsAPI,
 			responsesAPI,
 			conversationsAPI,
+			chatCompletionsAPI + "/render",
+			completionsAPI + "/render",
+			imagesGenerationsAPI,
 		},
 		Protocols: []v1.AppProtocol{v1.AppProtocolH2C, v1.AppProtocolHTTP},
 	}
@@ -111,15 +118,46 @@ func (p *OpenAIParser) ParseRequest(ctx context.Context, body []byte, headers ma
 	if err := json.Unmarshal(body, &bodyMap); err != nil {
 		return nil, fmt.Errorf("error unmarshaling request bodyMap: %w", err)
 	}
-	extractedBody, err := extractRequestBody(body, headers)
+	apiType := determineAPITypeFromPath(request.GetRequestPath(headers))
+	extractedBody, err := extractRequestBody(apiType, body)
 	if err != nil {
 		return nil, err
 	}
 	extractedBody.Payload = fwkrh.PayloadMap(bodyMap)
+	if model, ok := bodyMap["model"].(string); ok {
+		extractedBody.Model = model
+	}
+	extractedBody.MaxOutputTokens = maxOutputTokensForAPI(apiType, bodyMap)
 	if stream, ok := bodyMap["stream"].(bool); ok && stream {
 		extractedBody.Stream = true
 	}
 	return &fwkrh.ParseResult{Body: extractedBody, SkipResponseProcessing: false}, nil
+}
+
+// RewriteModelName writes the resolved model into the request payload map.
+func (p *OpenAIParser) RewriteModelName(payload fwkrh.MarshalablePayload, model string) (fwkrh.MarshalablePayload, error) {
+	m, ok := payload.(fwkrh.PayloadMap)
+	if !ok {
+		return payload, nil
+	}
+	m["model"] = model
+	return m, nil
+}
+
+// maxOutputTokensForAPI normalizes the per-API output-token cap field into a
+// single value, applying each API's field name and precedence. Endpoints with no
+// output-token concept (conversations, embeddings) return nil.
+func maxOutputTokensForAPI(apiType string, bodyMap map[string]any) *int64 {
+	switch apiType {
+	case chatCompletionsAPI:
+		return fwkrh.MaxOutputTokensFromPayload(bodyMap, "max_completion_tokens", "max_tokens")
+	case completionsAPI:
+		return fwkrh.MaxOutputTokensFromPayload(bodyMap, "max_tokens")
+	case responsesAPI:
+		return fwkrh.MaxOutputTokensFromPayload(bodyMap, "max_output_tokens")
+	default:
+		return nil
+	}
 }
 
 // ParseResponse extracts usage metadata from the provider's response.
@@ -157,37 +195,38 @@ func (p *OpenAIParser) parseStreamResponse(chunk []byte) (*fwkrh.ParsedResponse,
 }
 
 // determineAPITypeFromPath determines the API type based on the request path.
-// Note: path strings have already been cleaned and normalized by the gateway/proxy layer
-// (no trailing slashes, query parameters, or additional suffix strings at this point).
 // The suffix-based matching supports both standard OpenAI paths (e.g. /v1/chat/completions)
 // and provider-specific paths (e.g. Vertex AI's /v1/projects/.../chat/completions).
+// Sub-paths /render under chat-completions and completions share the parent's body schema.
 func determineAPITypeFromPath(path string) string {
-	if strings.HasSuffix(path, "/conversations") {
+	if request.MatchPathSuffix(path, "/conversations") {
 		return conversationsAPI
 	}
-	if strings.HasSuffix(path, "/responses") {
+	if request.MatchPathSuffix(path, "/responses") {
 		return responsesAPI
 	}
-	if strings.HasSuffix(path, "/chat/completions") {
+	if request.MatchPathSuffix(path, "/chat/completions") ||
+		request.MatchPathSuffix(path, "/chat/completions/render") {
 		return chatCompletionsAPI
 	}
-	if strings.HasSuffix(path, "/completions") {
+	if request.MatchPathSuffix(path, "/completions") ||
+		request.MatchPathSuffix(path, "/completions/render") {
 		return completionsAPI
 	}
-	if strings.HasSuffix(path, "/embeddings") {
+	if request.MatchPathSuffix(path, "/embeddings") {
 		return embeddingsAPI
+	}
+	if request.MatchPathSuffix(path, "/images/generations") {
+		return imagesGenerationsAPI
 	}
 
 	// Default to completions API for backward compatibility with existing clients and integration tests
 	return completionsAPI
 }
 
-// extractRequestBody extracts the InferenceRequestBody from the given request body map using path-based detection.
-func extractRequestBody(rawBody []byte, headers map[string]string) (*fwkrh.InferenceRequestBody, error) {
-	// Determine API type from request path
-	path := request.GetRequestPath(headers)
-	apiType := determineAPITypeFromPath(path)
-
+// extractRequestBody extracts the InferenceRequestBody from the given raw body
+// for the already-resolved API type.
+func extractRequestBody(apiType string, rawBody []byte) (*fwkrh.InferenceRequestBody, error) {
 	switch apiType {
 	case conversationsAPI:
 		var conversations fwkrh.ConversationsRequest
@@ -225,6 +264,13 @@ func extractRequestBody(rawBody []byte, headers map[string]string) (*fwkrh.Infer
 			return &fwkrh.InferenceRequestBody{Embeddings: &embeddings}, nil
 		}
 		return nil, errors.New("invalid embeddings request: must have input field")
+
+	case imagesGenerationsAPI:
+		var images fwkrh.ImagesGenerationsRequest
+		if err := json.Unmarshal(rawBody, &images); err == nil && images.Prompt != "" {
+			return &fwkrh.InferenceRequestBody{Images: &images}, nil
+		}
+		return nil, errors.New("invalid images generations request: must have prompt field")
 	default:
 		return nil, errors.New("unsupported API endpoint")
 	}
@@ -257,14 +303,14 @@ func toInt(v any) int {
 }
 
 func extractUsage(responseBytes []byte) (*fwkrh.Usage, error) {
-	var responseErr error
-	var responseBody map[string]any
-	responseErr = json.Unmarshal(responseBytes, &responseBody)
-	if responseErr != nil {
-		return nil, responseErr
+	var responseBody struct {
+		Usage map[string]any `json:"usage"`
 	}
-	usg, ok := responseBody[usageField].(map[string]any)
-	if !ok {
+	err := json.Unmarshal(responseBytes, &responseBody)
+	if err != nil {
+		return nil, err
+	}
+	if responseBody.Usage == nil {
 		return nil, nil //nolint:nilnil
 	}
 
@@ -272,7 +318,7 @@ func extractUsage(responseBytes []byte) (*fwkrh.Usage, error) {
 
 	// Chat/Completions APIs use prompt_tokens. Responses/Conversations APIs use input_tokens.
 	for _, inputTokens := range []string{promptTokensField, inputTokensField} {
-		if v, ok := usg[inputTokens]; ok && v != nil {
+		if v, ok := responseBody.Usage[inputTokens]; ok && v != nil {
 			usage.PromptTokens = toInt(v)
 			break
 		}
@@ -280,7 +326,7 @@ func extractUsage(responseBytes []byte) (*fwkrh.Usage, error) {
 
 	// Chat/Completions APIs use completion_tokens. Responses/Conversations APIs use output_tokens.
 	for _, outputTokens := range []string{completionTokensField, outputTokensField} {
-		if v, ok := usg[outputTokens]; ok && v != nil {
+		if v, ok := responseBody.Usage[outputTokens]; ok && v != nil {
 			usage.CompletionTokens = toInt(v)
 			break
 		}
@@ -288,7 +334,7 @@ func extractUsage(responseBytes []byte) (*fwkrh.Usage, error) {
 
 	// Chat/Completions APIs use prompt_tokens_details. Responses/Conversations APIs use input_tokens_details.
 	for _, details := range []string{promptTokensDetailsField, inputTokensDetailsField} {
-		if detailsMap, ok := usg[details].(map[string]any); ok {
+		if detailsMap, ok := responseBody.Usage[details].(map[string]any); ok {
 			if cachedTokens, ok := detailsMap[cachedTokensField]; ok {
 				usage.PromptTokenDetails = &fwkrh.PromptTokenDetails{
 					CachedTokens: toInt(cachedTokens),
@@ -298,7 +344,7 @@ func extractUsage(responseBytes []byte) (*fwkrh.Usage, error) {
 	}
 
 	// total_tokens field name is consistent across all API types.
-	if v, ok := usg[totalTokensField]; ok && v != nil {
+	if v, ok := responseBody.Usage[totalTokensField]; ok && v != nil {
 		usage.TotalTokens = toInt(v)
 	}
 
@@ -328,22 +374,21 @@ func extractUsageStreaming(responseText string) *fwkrh.Usage {
 	var streamResponse struct {
 		Usage    *fwkrh.Usage `json:"usage"`
 		Response struct {
-			Usage  map[string]any `json:"usage"`
-			Object string         `json:"object"`
+			Usage json.RawMessage `json:"usage"` // Delay JSON decoding until we know we have usage data
 		} `json:"response"`
 		Type string `json:"type"`
 	}
 
 	lines := strings.SplitSeq(responseText, "\n")
 	for line := range lines {
-		if !strings.HasPrefix(line, streamingRespPrefix) {
+		content, ok := strings.CutPrefix(line, streamingRespPrefix)
+		if !ok {
 			continue
 		}
-		content := strings.TrimPrefix(line, streamingRespPrefix)
-		if content == "[DONE]" {
+		// When the stream is terminated with [DONE] or there's not any usage data, skip the line
+		if content == "[DONE]" || !strings.Contains(content, "usage") {
 			continue
 		}
-
 		byteSlice := []byte(content)
 		if err := json.Unmarshal(byteSlice, &streamResponse); err != nil {
 			continue
@@ -353,11 +398,9 @@ func extractUsageStreaming(responseText string) *fwkrh.Usage {
 			return streamResponse.Usage
 		}
 		// Responses API streaming format
-		if streamResponse.Response.Usage != nil && streamResponse.Type == "response.completed" {
-			// Convert map[string]any to JSON and parse
+		if len(streamResponse.Response.Usage) > 0 && streamResponse.Type == "response.completed" {
 			jsonBytes, _ := json.Marshal(map[string]any{
-				"usage":  streamResponse.Response.Usage,
-				"object": streamResponse.Response.Object,
+				"usage": streamResponse.Response.Usage,
 			})
 			if usage, err := extractUsage(jsonBytes); err == nil && usage != nil {
 				return usage

@@ -34,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
@@ -97,6 +98,22 @@ func (m *MockRegistryDataPlane) WithConnection(key flowcontrol.FlowKey, fn func(
 	return nil
 }
 
+func (m *MockRegistryDataPlane) SubmitDesiredPriorities(_ map[int]struct{}) {}
+
+func (m *MockRegistryDataPlane) PriorityBandUpdateChannel() <-chan map[int]struct{} {
+	return nil
+}
+
+func (m *MockRegistryDataPlane) FlowGCTimeout() time.Duration {
+	return time.Minute
+}
+
+func (m *MockRegistryDataPlane) ApplyDesiredPriorities(_ map[int]struct{}) {}
+
+func (m *MockRegistryDataPlane) ExecuteGCCycle() {}
+
+var _ contracts.FlowRegistry = &MockRegistryDataPlane{}
+
 var _ contracts.FlowRegistryDataPlane = &MockRegistryDataPlane{}
 
 // --- Dependency Mocks ---
@@ -142,29 +159,20 @@ func (m *MockEndpointCandidates) Locate(ctx context.Context, requestMetadata map
 // It is used for tests that need to control the exact return values of a queue's methods without simulating the queue's
 // internal logic or state.
 type MockSafeQueue struct {
-	NameV         string
-	CapabilitiesV []flowcontrol.QueueCapability
-	LenV          int
-	ByteSizeV     uint64
-	PeekHeadV     flowcontrol.QueueItemAccessor
-	PeekTailV     flowcontrol.QueueItemAccessor
-	AddFunc       func(item flowcontrol.QueueItemAccessor)
-	RemoveFunc    func(handle flowcontrol.QueueItemHandle) (flowcontrol.QueueItemAccessor, error)
-	CleanupFunc   func(predicate contracts.PredicateFunc) []flowcontrol.QueueItemAccessor
-	DrainFunc     func() []flowcontrol.QueueItemAccessor
+	LenV        int
+	ByteSizeV   uint64
+	PeekV       flowcontrol.QueueItemAccessor
+	AddFunc     func(item flowcontrol.QueueItemAccessor)
+	RemoveFunc  func(handle flowcontrol.QueueItemHandle) (flowcontrol.QueueItemAccessor, error)
+	CleanupFunc func(predicate contracts.PredicateFunc) []flowcontrol.QueueItemAccessor
+	DrainFunc   func() []flowcontrol.QueueItemAccessor
 }
 
-func (m *MockSafeQueue) Name() string                                { return m.NameV }
-func (m *MockSafeQueue) Capabilities() []flowcontrol.QueueCapability { return m.CapabilitiesV }
-func (m *MockSafeQueue) Len() int                                    { return m.LenV }
-func (m *MockSafeQueue) ByteSize() uint64                            { return m.ByteSizeV }
+func (m *MockSafeQueue) Len() int         { return m.LenV }
+func (m *MockSafeQueue) ByteSize() uint64 { return m.ByteSizeV }
 
-func (m *MockSafeQueue) PeekHead() flowcontrol.QueueItemAccessor {
-	return m.PeekHeadV
-}
-
-func (m *MockSafeQueue) PeekTail() flowcontrol.QueueItemAccessor {
-	return m.PeekTailV
+func (m *MockSafeQueue) Peek() flowcontrol.QueueItemAccessor {
+	return m.PeekV
 }
 
 func (m *MockSafeQueue) Add(item flowcontrol.QueueItemAccessor) {
@@ -319,9 +327,7 @@ func (m *MockManagedQueue) Drain() []flowcontrol.QueueItemAccessor {
 	return drained
 }
 
-func (m *MockManagedQueue) FlowKey() flowcontrol.FlowKey                { return m.FlowKeyV }
-func (m *MockManagedQueue) Name() string                                { return "" }
-func (m *MockManagedQueue) Capabilities() []flowcontrol.QueueCapability { return nil }
+func (m *MockManagedQueue) FlowKey() flowcontrol.FlowKey { return m.FlowKeyV }
 func (m *MockManagedQueue) OrderingPolicy() flowcontrol.OrderingPolicy {
 	if m.OrderingPolicyFunc != nil {
 		return m.OrderingPolicyFunc()
@@ -349,8 +355,8 @@ func (m *MockManagedQueue) ByteSize() uint64 {
 	return size
 }
 
-// PeekHead returns the first item found in the mock queue. Note: map iteration order is not guaranteed.
-func (m *MockManagedQueue) PeekHead() flowcontrol.QueueItemAccessor {
+// Peek returns the first item found in the mock queue. Note: map iteration order is not guaranteed.
+func (m *MockManagedQueue) Peek() flowcontrol.QueueItemAccessor {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.init()
@@ -358,9 +364,4 @@ func (m *MockManagedQueue) PeekHead() flowcontrol.QueueItemAccessor {
 		return item // Return first item found
 	}
 	return nil // Queue is empty
-}
-
-// PeekTail is not implemented for this mock.
-func (m *MockManagedQueue) PeekTail() flowcontrol.QueueItemAccessor {
-	return nil
 }

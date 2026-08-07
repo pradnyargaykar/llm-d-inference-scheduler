@@ -15,11 +15,8 @@ limitations under the License.
 */
 
 // Package vllmhttp provides a request parser for vLLM HTTP endpoints that are
-// not part of the OpenAI-compatible API surface — currently just
-// /inference/v1/generate (the disaggregated Prefill/Decode API). All other
-// paths are delegated to the embedded OpenAI parser, so a single
-// vllmhttp-parser plugin instance covers both vLLM-specific and OpenAI-
-// compatible HTTP traffic served by the same endpoint.
+// not part of the OpenAI-compatible API surface — specifically
+// /inference/v1/generate.
 package vllmhttp
 
 import (
@@ -41,16 +38,19 @@ const (
 	// VllmHTTPParserType is the canonical type name used to register the plugin.
 	VllmHTTPParserType = "vllmhttp-parser"
 
-	// generatePathSuffix is the vLLM disaggregated Prefill/Decode API path.
+	// generatePathSuffix is the vLLM custom generate API path.
 	generatePathSuffix = "inference/v1/generate"
 )
 
 // compile-time type validation
-var _ fwkrh.Parser = &VllmHTTPParser{}
+var (
+	_ fwkrh.Parser            = &VllmHTTPParser{}
+	_ fwkrh.ModelNameRewriter = &VllmHTTPParser{}
+)
 
 // VllmHTTPParser implements fwkrh.Parser for vLLM HTTP endpoints. It handles
-// /inference/v1/generate locally and delegates all other paths to an embedded
-// OpenAI parser so that the same plugin can serve mixed traffic.
+// /inference/v1/generate and delegates response parsing to an embedded
+// OpenAI parser.
 type VllmHTTPParser struct {
 	typedName fwkplugin.TypedName
 	openai    *openai.OpenAIParser
@@ -105,6 +105,11 @@ func (p *VllmHTTPParser) ParseResponse(ctx context.Context, body []byte, headers
 	return p.openai.ParseResponse(ctx, body, headers, isStreaming)
 }
 
+// RewriteModelName delegates to the OpenAI parser; the generate body shares the payload map format.
+func (p *VllmHTTPParser) RewriteModelName(payload fwkrh.MarshalablePayload, model string) (fwkrh.MarshalablePayload, error) {
+	return p.openai.RewriteModelName(payload, model)
+}
+
 // parseGenerateRequest decodes a /inference/v1/generate body into an
 // InferenceRequestBody. Token IDs are required; everything else is optional.
 func (p *VllmHTTPParser) parseGenerateRequest(rawBody []byte) (*fwkrh.ParseResult, error) {
@@ -124,6 +129,13 @@ func (p *VllmHTTPParser) parseGenerateRequest(rawBody []byte) (*fwkrh.ParseResul
 	body := &fwkrh.InferenceRequestBody{
 		Generate: &generate,
 		Payload:  fwkrh.PayloadMap(bodyMap),
+	}
+	if model, ok := bodyMap["model"].(string); ok {
+		body.Model = model
+	}
+	// max_tokens lives under sampling_params in the generate wire format.
+	if sp, ok := bodyMap["sampling_params"].(map[string]any); ok {
+		body.MaxOutputTokens = fwkrh.MaxOutputTokensFromPayload(sp, "max_tokens")
 	}
 	if stream, ok := bodyMap["stream"].(bool); ok && stream {
 		body.Stream = true

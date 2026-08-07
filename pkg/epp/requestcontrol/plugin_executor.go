@@ -24,6 +24,7 @@ import (
 
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/metrics"
 )
 
 // executePluginsAsDAG executes DataProducer plugins as a DAG based on their dependencies asynchronously.
@@ -31,11 +32,25 @@ import (
 // If there is a cycle or any plugin fails with error, it returns an error.
 func executePluginsAsDAG(ctx context.Context, plugins []fwkrc.DataProducer, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) error {
 	for _, plugin := range plugins {
-		if err := plugin.Produce(ctx, request, endpoints); err != nil {
+		before := time.Now()
+		err := plugin.Produce(ctx, request, endpoints)
+		metrics.RecordPluginProcessingLatency(fwkrc.DataProducerExtensionPoint, plugin.TypedName().Type, plugin.TypedName().Name, time.Since(before))
+		if err != nil {
 			return fmt.Errorf("DataProducer %q failed: %w", plugin.TypedName().String(), err)
 		}
 	}
 	return nil
+}
+
+// producerTimeout returns the producer's declared timeout when it implements
+// TimeoutAwareProducer with a positive value, otherwise dataProducerTimeout.
+func producerTimeout(p fwkrc.DataProducer) time.Duration {
+	if tp, ok := p.(fwkrc.TimeoutAwareProducer); ok {
+		if t := tp.ProduceTimeout(); t > 0 {
+			return t
+		}
+	}
+	return dataProducerTimeout
 }
 
 // dataProducerPluginsWithTimeout executes DataProducer plugins with a timeout.
