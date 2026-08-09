@@ -625,9 +625,8 @@ func (r *Runner) registerInTreePlugins() {
 	fwkplugin.Register(preciseprefixcache.PrecisePrefixCachePluginType, fwkplugin.StabilityBeta, preciseprefixcache.PluginFactory)
 	fwkplugin.Register(mmcacheaffinity.Type, fwkplugin.StabilityBeta, mmcacheaffinity.Factory)
 	fwkplugin.Register(preciseproducer.PluginType, fwkplugin.StabilityBeta, preciseproducer.PluginFactory)
-	// Alpha
-	fwkplugin.Register(programawarescorer.ProgramAwareScorerPluginType, fwkplugin.StabilityAlpha, programawarescorer.ProgramAwareScorerPluginFactory)
-	fwkplugin.Register(programawarepinning.ProgramAwareScorerPluginType, fwkplugin.StabilityAlpha, programawarepinning.ProgramAwareScorerPluginFactory)
+	fwkplugin.Register(programawarescorer.ProgramAwareScorerPluginType, fwkplugin.StabilityBeta, programawarescorer.ProgramAwareScorerPluginFactory)
+	fwkplugin.Register(programawarepinning.ProgramAwareScorerPluginType, fwkplugin.StabilityBeta, programawarepinning.ProgramAwareScorerPluginFactory)
 	fwkplugin.Register(headerprofile.HeaderProfileHandlerType, fwkplugin.StabilityAlpha, headerprofile.HeaderProfileHandlerFactory)
 	fwkplugin.Register(endpointattribute.EndpointAttributeScorerType, fwkplugin.StabilityAlpha, endpointattribute.EndpointAttributeScorerFactory)
 	fwkplugin.Register(topologyaffinityscorer.ScorerType, fwkplugin.StabilityAlpha, topologyaffinityscorer.Factory)
