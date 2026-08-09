@@ -21,9 +21,12 @@ package programaware
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
@@ -31,6 +34,16 @@ import (
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 )
+
+// safeRegisterCollector registers a collector, ignoring AlreadyRegisteredError.
+func safeRegisterCollector(reg prometheus.Registerer, c prometheus.Collector) {
+	if err := reg.Register(c); err != nil {
+		var alreadyRegistered prometheus.AlreadyRegisteredError
+		if errors.As(err, &alreadyRegistered) {
+			return
+		}
+	}
+}
 
 // ProgramAwarePluginType is the registered type name for this plugin.
 const ProgramAwarePluginType = "program-aware-fairness"
@@ -174,10 +187,10 @@ func ProgramAwarePluginFactory(name string, parameters *json.Decoder, handle plu
 	if handle != nil {
 		if reg := handle.Metrics(); reg != nil {
 			for _, c := range GetCollectors() {
-				reg.MustRegister(c)
+				safeRegisterCollector(reg, c)
 			}
 			for _, c := range strategy.Collectors() {
-				reg.MustRegister(c)
+				safeRegisterCollector(reg, c)
 			}
 		}
 		if cfg.EvictionTTLSeconds > 0 {
