@@ -146,14 +146,14 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 	pinnedKey := p.pins[programID]
 	p.mu.RUnlock()
 
-	// 1. Max Queue Load across candidate endpoints
-	maxQueue := 0.0
+	// 1. Max Total Load (Running + Waiting) across candidate endpoints
+	maxLoad := 0.0
 	for _, ep := range endpoints {
 		m := ep.GetMetrics()
 		if m != nil {
-			q := float64(m.WaitingQueueSize)
-			if q > maxQueue {
-				maxQueue = q
+			load := float64(m.RunningRequestsSize + m.WaitingQueueSize)
+			if load > maxLoad {
+				maxLoad = load
 			}
 		}
 	}
@@ -179,15 +179,15 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 			pinBoost = 1.0
 		}
 
-		// Relative Queue Load Penalty (0.0 to 1.0) non-linear quadratic scaling
+		// Relative Load Penalty (0.0 to 1.0) non-linear quadratic scaling combining active running and waiting requests
 		metrics := endpoint.GetMetrics()
-		queueSize := 0.0
+		totalLoad := 0.0
 		if metrics != nil {
-			queueSize = float64(metrics.WaitingQueueSize)
+			totalLoad = float64(metrics.RunningRequestsSize + metrics.WaitingQueueSize)
 		}
 		relLoad := 0.0
-		if maxQueue > 0 {
-			normLoad := queueSize / maxQueue
+		if maxLoad > 0 {
+			normLoad := totalLoad / maxLoad
 			relLoad = normLoad * normLoad
 		}
 
