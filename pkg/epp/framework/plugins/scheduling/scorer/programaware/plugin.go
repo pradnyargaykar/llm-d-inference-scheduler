@@ -170,15 +170,6 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 	for _, endpoint := range endpoints {
 		podID := endpoint.GetMetadata().GetNamespacedName().String()
 
-		// Prefix Cache Match Ratio (0.0 to 1.0)
-		cacheScore := p.getCacheScore(ctx, endpoint)
-
-		// Pin Affinity Boost (+1.0 if home pod, 0.0 otherwise)
-		pinBoost := 0.0
-		if pinnedKey != "" && podID == pinnedKey {
-			pinBoost = 1.0
-		}
-
 		// Relative Load Penalty (0.0 to 1.0) non-linear quadratic scaling combining active running and waiting requests
 		metrics := endpoint.GetMetrics()
 		totalLoad := 0.0
@@ -191,12 +182,23 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 			relLoad = normLoad * normLoad
 		}
 
-		// Physical KV Cache Recompute Penalty (0.0 to 1.0)
-		recomputePenalty := (1.0 - cacheScore) * contextRatio
+		// Prefix Cache Match Ratio (0.0 to 1.0)
+		cacheScore := p.getCacheScore(ctx, endpoint)
 
-		// Clean 2-Penalty Formula:
-		// Score = CacheScore + PinBoost - RelLoad - RecomputePenalty
-		score := cacheScore + pinBoost - relLoad - recomputePenalty
+		// Dynamic Load-Scaled Pin Boost:
+		// Scales smoothly from 0.35 under moderate concurrency (c50-rate10) up to 1.00 under high concurrency (c256-rate25)
+		pinBoost := 0.0
+		if pinnedKey != "" && podID == pinnedKey {
+			boost := 0.20 + (0.05 * maxLoad)
+			if boost > 1.0 {
+				boost = 1.0
+			}
+			pinBoost = boost
+		}
+
+		// Clean 2-Term Load-Balanced Formula:
+		// Score = CacheScore + PinBoost - RelLoad
+		score := cacheScore + pinBoost - relLoad
 		scores[endpoint] = score
 
 		// Record metrics for observability
@@ -213,14 +215,12 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 		}
 		routingDecisionsTotal.WithLabelValues(programID, podID, decisionType).Inc()
 
-		logger.V(logutil.VERBOSE).Info("Scored endpoint 2-penalty",
+		logger.V(logutil.VERBOSE).Info("Scored endpoint clean formula",
 			"endpoint", podID,
 			"programID", programID,
 			"cacheScore", cacheScore,
 			"pinBoost", pinBoost,
 			"relLoad", relLoad,
-			"recomputePenalty", recomputePenalty,
-			"contextRatio", contextRatio,
 			"finalScore", score)
 	}
 
@@ -330,6 +330,14 @@ func (p *Plugin) ResponseBody(ctx context.Context, req *scheduling.InferenceRequ
 		"completionTokens", completionTokens,
 		"totalTokensSoFar", totalTokensSoFar,
 		"maxActiveTokens", p.maxActiveTokens)
+}
+
+// SetPin sets the pinned pod ID for a program ID (used for testing)
+func (p *Plugin) SetPin(programID string, podID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pins[programID] = podID
+	p.podCount[podID]++
 }
 
 // GetProgramTokens returns the accumulated tokens for a program ID (used for testing)
