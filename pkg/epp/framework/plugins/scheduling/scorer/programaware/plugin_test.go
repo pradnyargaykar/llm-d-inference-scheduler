@@ -66,6 +66,7 @@ func TestProgramAwareScorer(t *testing.T) {
 			p := programaware.New(ctx, "test-scorer", cfg)
 
 			p.SetProgramTokens("program-1", tc.tokensSoFar)
+			p.SetPin("program-1", endpointA.GetMetadata().GetNamespacedName().String())
 
 			req := &scheduling.InferenceRequest{
 				FairnessID: "program-1",
