@@ -19,6 +19,7 @@ package preciseprefixcache
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -27,7 +28,7 @@ import (
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 )
 
-// extractEndpointSet builds the "address:port" identifier set used to filter
+// extractEndpointSet builds the identifier set used to filter
 // kvblock.Index lookups to candidate endpoints. Endpoints without metadata
 // are skipped.
 func extractEndpointSet(endpoints []scheduling.Endpoint) sets.Set[string] {
@@ -35,9 +36,17 @@ func extractEndpointSet(endpoints []scheduling.Endpoint) sets.Set[string] {
 	for _, ep := range endpoints {
 		if m := ep.GetMetadata(); m != nil {
 			endpointSet.Insert(fmt.Sprintf("%s:%s", m.Address, m.Port))
+			endpointSet.Insert(m.Address)
 		}
 	}
 	return endpointSet
+}
+
+func matchPodIdentifier(stored, target string) bool {
+	if stored == target {
+		return true
+	}
+	return strings.Split(stored, ":")[0] == strings.Split(target, ":")[0]
 }
 
 // matchedBlockCount returns the number of contiguous cached prefix blocks held
@@ -48,7 +57,7 @@ func extractEndpointSet(endpoints []scheduling.Endpoint) sets.Set[string] {
 func matchedBlockCount(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry, podID string) int {
 	count := 0
 	for _, key := range keys {
-		if !slices.ContainsFunc(keyToPods[key], func(e kvblock.PodEntry) bool { return e.PodIdentifier == podID }) {
+		if !slices.ContainsFunc(keyToPods[key], func(e kvblock.PodEntry) bool { return matchPodIdentifier(e.PodIdentifier, podID) }) {
 			break
 		}
 		count++
@@ -71,7 +80,7 @@ func matchedBlockCountByTier(keys []kvblock.BlockHash, keyToPods map[kvblock.Blo
 	for _, key := range keys {
 		tiersAtKey := sets.New[string]()
 		for _, e := range keyToPods[key] {
-			if e.PodIdentifier == podID {
+			if matchPodIdentifier(e.PodIdentifier, podID) {
 				if e.Speculative {
 					tiersAtKey.Insert(attrprefix.SpeculativeTierKey)
 				} else {
