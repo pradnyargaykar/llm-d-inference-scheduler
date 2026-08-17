@@ -18,13 +18,14 @@ func TestProgramAwareScorer(t *testing.T) {
 	producerName := "test-producer"
 	matchKey := attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(producerName).String()
 
-	// Pod A: Cache hit, moderate load (load = 2, kvUtil = 0.5)
+	// Pod A: Cache hit, moderate healthy load (running = 2, queue = 0, kvUtil = 0.5)
 	attrA := fwkdl.NewAttributes()
 	attrA.Put(matchKey, attrprefix.NewPrefixCacheMatchInfo(10, 10, 16)) // 100% cache hit
 	endpointA := scheduling.NewEndpoint(
 		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod-a"}},
 		&fwkdl.Metrics{
-			WaitingQueueSize:    2,
+			RunningRequestsSize: 2,
+			WaitingQueueSize:    0,
 			KVCacheUsagePercent: 0.5,
 		},
 		attrA,
@@ -122,3 +123,149 @@ func TestResponseBodyTokenAccumulation(t *testing.T) {
 		t.Errorf("Expected 400 tokens accumulated, got %d", tokens)
 	}
 }
+
+func TestZeroQueueLowConcurrency(t *testing.T) {
+	producerName := "test-producer"
+	matchKey := attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(producerName).String()
+
+	// Pod A: Cache hit (85%), Running = 1, Queue = 0
+	attrA := fwkdl.NewAttributes()
+	attrA.Put(matchKey, attrprefix.NewPrefixCacheMatchInfo(85, 100, 16))
+	endpointA := scheduling.NewEndpoint(
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod-a"}},
+		&fwkdl.Metrics{
+			RunningRequestsSize: 1,
+			WaitingQueueSize:    0,
+		},
+		attrA,
+	)
+
+	// Pod B: Cache miss (0%), Running = 0, Queue = 0
+	endpointB := scheduling.NewEndpoint(
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod-b"}},
+		&fwkdl.Metrics{
+			RunningRequestsSize: 0,
+			WaitingQueueSize:    0,
+		},
+		nil,
+	)
+
+	ctx := context.Background()
+	p := programaware.New(ctx, "test-scorer", programaware.Config{PrefixMatchInfoProducerName: producerName})
+	p.SetPin("program-1", endpointA.GetMetadata().GetNamespacedName().String())
+
+	req := &scheduling.InferenceRequest{FairnessID: "program-1"}
+	scores := p.Score(ctx, req, []scheduling.Endpoint{endpointA, endpointB})
+
+	if scores[endpointA] <= scores[endpointB] {
+		t.Errorf("Expected cache hit pod A to win under zero queue, got A: %f, B: %f", scores[endpointA], scores[endpointB])
+	}
+}
+
+func TestSpilloverOnOverloadedQueue(t *testing.T) {
+	producerName := "test-producer"
+	matchKey := attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(producerName).String()
+
+	// Pod A: Pinned Home Pod with partial cache hit (20%), but heavily overloaded (Running = 15, Queue = 10 -> Load = 35)
+	attrA := fwkdl.NewAttributes()
+	attrA.Put(matchKey, attrprefix.NewPrefixCacheMatchInfo(20, 100, 16))
+	endpointA := scheduling.NewEndpoint(
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod-a"}},
+		&fwkdl.Metrics{
+			RunningRequestsSize: 15,
+			WaitingQueueSize:    10,
+		},
+		attrA,
+	)
+
+	// Pod B: Idle Pod (Running = 0, Queue = 0, Cache = 0)
+	endpointB := scheduling.NewEndpoint(
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod-b"}},
+		&fwkdl.Metrics{
+			RunningRequestsSize: 0,
+			WaitingQueueSize:    0,
+		},
+		nil,
+	)
+
+	ctx := context.Background()
+	p := programaware.New(ctx, "test-scorer", programaware.Config{PrefixMatchInfoProducerName: producerName})
+	p.SetPin("program-1", endpointA.GetMetadata().GetNamespacedName().String())
+
+	req := &scheduling.InferenceRequest{FairnessID: "program-1"}
+	scores := p.Score(ctx, req, []scheduling.Endpoint{endpointA, endpointB})
+
+	if scores[endpointB] <= scores[endpointA] {
+		t.Errorf("Expected idle pod B to win over overloaded pod A, got A: %f, B: %f", scores[endpointA], scores[endpointB])
+	}
+}
+
+func TestColdStartLeastPinsBalancing(t *testing.T) {
+	// Pod A: Pinned by 10 programs
+	endpointA := scheduling.NewEndpoint(
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod-a"}},
+		&fwkdl.Metrics{WaitingQueueSize: 0},
+		nil,
+	)
+
+	// Pod B: Pinned by 1 program
+	endpointB := scheduling.NewEndpoint(
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod-b"}},
+		&fwkdl.Metrics{WaitingQueueSize: 0},
+		nil,
+	)
+
+	ctx := context.Background()
+	p := programaware.New(ctx, "test-scorer", programaware.Config{})
+	for i := 0; i < 10; i++ {
+		p.SetPin(string(rune('A'+i)), endpointA.GetMetadata().GetNamespacedName().String())
+	}
+	p.SetPin("other-prog", endpointB.GetMetadata().GetNamespacedName().String())
+
+	// Brand new program (cold start)
+	req := &scheduling.InferenceRequest{FairnessID: "brand-new-program"}
+	scores := p.Score(ctx, req, []scheduling.Endpoint{endpointA, endpointB})
+
+	if scores[endpointB] <= scores[endpointA] {
+		t.Errorf("Expected less-pinned pod B to win cold start, got A: %f, B: %f", scores[endpointA], scores[endpointB])
+	}
+}
+
+func TestSpilloverOn100PercentWarmOverloadedRunning(t *testing.T) {
+	producerName := "test-producer"
+	matchKey := attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(producerName).String()
+
+	// Pod A: Pinned Home Pod with 100% cache hit, but heavily overloaded with running decodes (Running = 20, Queue = 0)
+	attrA := fwkdl.NewAttributes()
+	attrA.Put(matchKey, attrprefix.NewPrefixCacheMatchInfo(100, 100, 16))
+	endpointA := scheduling.NewEndpoint(
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod-a"}},
+		&fwkdl.Metrics{
+			RunningRequestsSize: 20,
+			WaitingQueueSize:    0,
+		},
+		attrA,
+	)
+
+	// Pod B: Idle Pod (Running = 0, Queue = 0, Cache = 0)
+	endpointB := scheduling.NewEndpoint(
+		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod-b"}},
+		&fwkdl.Metrics{
+			RunningRequestsSize: 0,
+			WaitingQueueSize:    0,
+		},
+		nil,
+	)
+
+	ctx := context.Background()
+	p := programaware.New(ctx, "test-scorer", programaware.Config{PrefixMatchInfoProducerName: producerName})
+	p.SetPin("program-1", endpointA.GetMetadata().GetNamespacedName().String())
+
+	req := &scheduling.InferenceRequest{FairnessID: "program-1"}
+	scores := p.Score(ctx, req, []scheduling.Endpoint{endpointA, endpointB})
+
+	if scores[endpointB] <= scores[endpointA] {
+		t.Errorf("Expected idle pod B to win over overloaded warm pod A (20 running), got A: %f, B: %f", scores[endpointA], scores[endpointB])
+	}
+}
+

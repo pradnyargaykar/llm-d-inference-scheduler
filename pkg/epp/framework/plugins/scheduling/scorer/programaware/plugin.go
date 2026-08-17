@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 
@@ -70,6 +71,7 @@ type Plugin struct {
 // compile-time type assertions
 var (
 	_ scheduling.Scorer                    = &Plugin{}
+	_ plugin.ConsumerPlugin                = &Plugin{}
 	_ requestcontrol.PreRequest            = &Plugin{}
 	_ requestcontrol.ResponseBodyProcessor = &Plugin{}
 )
@@ -123,8 +125,21 @@ func (p *Plugin) Category() scheduling.ScorerCategory {
 	return scheduling.Affinity
 }
 
-// Score computes a clean model-agnostic, zero-tuning 2-penalty score for candidate endpoints.
-// Formula: Score_i = CacheScore + PinBoost - RelLoad - RecomputePenalty
+// Produces returns the data produced by the plugin.
+func (p *Plugin) Produces() map[plugin.DataKey]any {
+	return map[plugin.DataKey]any{}
+}
+
+// Consumes declares that this plugin requires PrefixCacheMatchInfo from the data producer.
+// This is critical for the EPP DAG to execute the precise-prefix-cache-producer!
+func (p *Plugin) Consumes() plugin.DataDependencies {
+	return plugin.DataDependencies{
+		Required: map[plugin.DataKey]any{p.prefixMatchDataKey: attrprefix.PrefixCacheMatchInfo{}},
+	}
+}
+
+// Score computes a parameter-free, model-agnostic score for candidate endpoints.
+// Formula: Score_i = 2.0*CacheScore + PinBoost - RelQueue - RecomputePenalty - 0.10*RelPins
 func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, endpoints []scheduling.Endpoint) map[scheduling.Endpoint]float64 {
 	logger := log.FromContext(ctx)
 	scores := make(map[scheduling.Endpoint]float64, len(endpoints))
@@ -146,19 +161,7 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 	pinnedKey := p.pins[programID]
 	p.mu.RUnlock()
 
-	// 1. Max Total Load (Running + Waiting) across candidate endpoints
-	maxLoad := 0.0
-	for _, ep := range endpoints {
-		m := ep.GetMetrics()
-		if m != nil {
-			load := float64(m.RunningRequestsSize + m.WaitingQueueSize)
-			if load > maxLoad {
-				maxLoad = load
-			}
-		}
-	}
-
-	// 2. Relative KV Context Ratio (0.0 to 1.0) dynamically scaled by Max Workload KV
+	// 1. Relative KV Context Ratio (0.0 to 1.0) based on accumulated program tokens
 	if maxActive < 1000 {
 		maxActive = 1000
 	}
@@ -167,38 +170,92 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 		contextRatio = 1.0
 	}
 
+	// 2. Relative load bounds & pin counts across current candidate endpoints
+	// Total load combines running requests and waiting queue (weighted 2x for waiting requests).
+	minLoad := math.MaxInt32
+	maxLoad := math.MinInt32
+	minPins := math.MaxInt32
+	maxPins := math.MinInt32
+	hasWaiting := false
+
+	for _, ep := range endpoints {
+		running := 0
+		waiting := 0
+		if m := ep.GetMetrics(); m != nil {
+			running = m.RunningRequestsSize
+			waiting = m.WaitingQueueSize
+		}
+		if waiting > 0 {
+			hasWaiting = true
+		}
+		load := running + (2 * waiting)
+		if load < minLoad {
+			minLoad = load
+		}
+		if load > maxLoad {
+			maxLoad = load
+		}
+
+		podID := ep.GetMetadata().GetNamespacedName().String()
+		p.mu.RLock()
+		pc := p.podCount[podID]
+		p.mu.RUnlock()
+		if pc < minPins {
+			minPins = pc
+		}
+		if pc > maxPins {
+			maxPins = pc
+		}
+	}
+
+	// 3. Compute score for each endpoint
 	for _, endpoint := range endpoints {
 		podID := endpoint.GetMetadata().GetNamespacedName().String()
-
-		// Relative Load Penalty (0.0 to 1.0) non-linear quadratic scaling combining active running and waiting requests
-		metrics := endpoint.GetMetrics()
-		totalLoad := 0.0
-		if metrics != nil {
-			totalLoad = float64(metrics.RunningRequestsSize + metrics.WaitingQueueSize)
+		m := endpoint.GetMetrics()
+		running := 0
+		waiting := 0
+		if m != nil {
+			running = m.RunningRequestsSize
+			waiting = m.WaitingQueueSize
 		}
-		relLoad := 0.0
-		if maxLoad > 0 {
-			normLoad := totalLoad / maxLoad
-			relLoad = normLoad * normLoad
-		}
+		load := running + (2 * waiting)
 
-		// Prefix Cache Match Ratio (0.0 to 1.0)
+		// A. Prefix Cache Match Ratio (0.0 to 1.0)
 		cacheScore := p.getCacheScore(ctx, endpoint)
 
-		// Dynamic Load-Scaled Pin Boost:
-		// Scales smoothly from 0.35 under moderate concurrency (c50-rate10) up to 1.00 under high concurrency (c256-rate25)
-		pinBoost := 0.0
-		if pinnedKey != "" && podID == pinnedKey {
-			boost := 0.20 + (0.05 * maxLoad)
-			if boost > 1.0 {
-				boost = 1.0
-			}
-			pinBoost = boost
+		// B. Relative Load Congestion Penalty (0.0 to 1.0, active when load delta >= 3 or queue > 0)
+		relLoad := 0.0
+		if maxLoad > minLoad && (maxLoad-minLoad >= 3 || hasWaiting) {
+			relLoad = float64(load-minLoad) / float64(maxLoad-minLoad)
 		}
 
-		// Clean 2-Term Load-Balanced Formula:
-		// Score = CacheScore + PinBoost - RelLoad
-		score := cacheScore + pinBoost - relLoad
+		// C. Dynamic Sticky Home-Pod Pin Boost
+		// Provides affinity under low-to-moderate concurrency (0.50), but tapers smoothly to 0.0 under high congestion
+		// so overloaded pods do not lock requests and degrade cluster TPOT.
+		pinBoost := 0.0
+		if pinnedKey != "" && podID == pinnedKey {
+			if relLoad >= 0.80 {
+				pinBoost = 0.0
+			} else {
+				pinBoost = 0.50 * (1.0 - relLoad)
+			}
+		}
+
+		// D. Physical KV Cache Recompute Penalty
+		// Scaled by 0.30 to reflect physical GPU recompute time (60ms) and avoid artificial negative lockout on idle pods.
+		recomputePenalty := (1.0 - cacheScore) * contextRatio * 0.30
+
+		// E. Cold-start program balance tie-breaker
+		relPins := 0.0
+		if maxPins > minPins {
+			p.mu.RLock()
+			pc := p.podCount[podID]
+			p.mu.RUnlock()
+			relPins = float64(pc-minPins) / float64(maxPins-minPins)
+		}
+
+		// Score = 2.0*CacheScore + PinBoost - 2.50*RelLoad - RecomputePenalty - 0.10*RelPins
+		score := (2.0 * cacheScore) + pinBoost - (2.50 * relLoad) - recomputePenalty - (0.10 * relPins)
 		scores[endpoint] = score
 
 		// Record metrics for observability
@@ -215,12 +272,17 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 		}
 		routingDecisionsTotal.WithLabelValues(programID, podID, decisionType).Inc()
 
-		logger.V(logutil.VERBOSE).Info("Scored endpoint clean formula",
+		logger.V(logutil.VERBOSE).Info("Scored endpoint program-aware",
 			"endpoint", podID,
 			"programID", programID,
 			"cacheScore", cacheScore,
 			"pinBoost", pinBoost,
 			"relLoad", relLoad,
+			"load", load,
+			"running", running,
+			"waiting", waiting,
+			"recomputePenalty", recomputePenalty,
+			"contextRatio", contextRatio,
 			"finalScore", score)
 	}
 

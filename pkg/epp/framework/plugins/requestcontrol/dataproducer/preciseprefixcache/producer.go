@@ -378,6 +378,9 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		}
 		addr := fmt.Sprintf("%s:%s", md.Address, md.Port)
 		matchLen := int(aggregatedScores[addr])
+		if matchLen == 0 && md.Address != "" {
+			matchLen = int(aggregatedScores[md.Address])
+		}
 		if matchLen > maxMatch {
 			maxMatch = matchLen
 		}
