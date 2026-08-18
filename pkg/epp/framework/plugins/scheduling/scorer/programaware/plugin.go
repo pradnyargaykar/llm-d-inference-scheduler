@@ -170,12 +170,9 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 		contextRatio = 1.0
 	}
 
-	// 2. Relative load bounds & pin counts across current candidate endpoints
-	// Total load combines running requests and waiting queue (weighted 2x for waiting requests).
+	// 2. Relative load bounds across current candidate endpoints
 	minLoad := math.MaxInt32
 	maxLoad := math.MinInt32
-	minPins := math.MaxInt32
-	maxPins := math.MinInt32
 	hasWaiting := false
 
 	for _, ep := range endpoints {
@@ -188,23 +185,12 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 		if waiting > 0 {
 			hasWaiting = true
 		}
-		load := running + (2 * waiting)
+		load := running + waiting
 		if load < minLoad {
 			minLoad = load
 		}
 		if load > maxLoad {
 			maxLoad = load
-		}
-
-		podID := ep.GetMetadata().GetNamespacedName().String()
-		p.mu.RLock()
-		pc := p.podCount[podID]
-		p.mu.RUnlock()
-		if pc < minPins {
-			minPins = pc
-		}
-		if pc > maxPins {
-			maxPins = pc
 		}
 	}
 
@@ -218,44 +204,28 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 			running = m.RunningRequestsSize
 			waiting = m.WaitingQueueSize
 		}
-		load := running + (2 * waiting)
+		load := running + waiting
 
 		// A. Prefix Cache Match Ratio (0.0 to 1.0)
 		cacheScore := p.getCacheScore(ctx, endpoint)
 
-		// B. Relative Load Congestion Penalty (0.0 to 1.0, active when load delta >= 3 or queue > 0)
+		// B. Relative Load Congestion Penalty (0.0 to 1.0)
 		relLoad := 0.0
 		if maxLoad > minLoad && (maxLoad-minLoad >= 3 || hasWaiting) {
 			relLoad = float64(load-minLoad) / float64(maxLoad-minLoad)
 		}
 
-		// C. Dynamic Sticky Home-Pod Pin Boost
-		// Provides affinity under low-to-moderate concurrency (0.50), but tapers smoothly to 0.0 under high congestion
-		// so overloaded pods do not lock requests and degrade cluster TPOT.
+		// C. Static Sticky Home-Pod Pin Boost (+1.0 if home pod, 0.0 otherwise)
 		pinBoost := 0.0
 		if pinnedKey != "" && podID == pinnedKey {
-			if relLoad >= 0.80 {
-				pinBoost = 0.0
-			} else {
-				pinBoost = 0.50 * (1.0 - relLoad)
-			}
+			pinBoost = 1.0
 		}
 
 		// D. Physical KV Cache Recompute Penalty
-		// Scaled by 0.30 to reflect physical GPU recompute time (60ms) and avoid artificial negative lockout on idle pods.
-		recomputePenalty := (1.0 - cacheScore) * contextRatio * 0.30
+		recomputePenalty := (1.0 - cacheScore) * contextRatio
 
-		// E. Cold-start program balance tie-breaker
-		relPins := 0.0
-		if maxPins > minPins {
-			p.mu.RLock()
-			pc := p.podCount[podID]
-			p.mu.RUnlock()
-			relPins = float64(pc-minPins) / float64(maxPins-minPins)
-		}
-
-		// Score = 2.0*CacheScore + PinBoost - 2.50*RelLoad - RecomputePenalty - 0.10*RelPins
-		score := (2.0 * cacheScore) + pinBoost - (2.50 * relLoad) - recomputePenalty - (0.10 * relPins)
+		// Score = CacheScore + PinBoost - RecomputePenalty - RelLoad
+		score := cacheScore + pinBoost - recomputePenalty - relLoad
 		scores[endpoint] = score
 
 		// Record metrics for observability

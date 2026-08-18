@@ -162,11 +162,11 @@ func TestZeroQueueLowConcurrency(t *testing.T) {
 	}
 }
 
-func TestSpilloverOnOverloadedQueue(t *testing.T) {
+func TestStickyPinBoostMaintained(t *testing.T) {
 	producerName := "test-producer"
 	matchKey := attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(producerName).String()
 
-	// Pod A: Pinned Home Pod with partial cache hit (20%), but heavily overloaded (Running = 15, Queue = 10 -> Load = 35)
+	// Pod A: Pinned Home Pod with partial cache hit (20%), running = 15, queue = 10
 	attrA := fwkdl.NewAttributes()
 	attrA.Put(matchKey, attrprefix.NewPrefixCacheMatchInfo(20, 100, 16))
 	endpointA := scheduling.NewEndpoint(
@@ -195,20 +195,21 @@ func TestSpilloverOnOverloadedQueue(t *testing.T) {
 	req := &scheduling.InferenceRequest{FairnessID: "program-1"}
 	scores := p.Score(ctx, req, []scheduling.Endpoint{endpointA, endpointB})
 
-	if scores[endpointB] <= scores[endpointA] {
-		t.Errorf("Expected idle pod B to win over overloaded pod A, got A: %f, B: %f", scores[endpointA], scores[endpointB])
+	// With static pinBoost = 1.0, scoreA = 0.20 + 1.0 - 1.0 = 0.20, scoreB = 0.0
+	if scores[endpointA] <= scores[endpointB] {
+		t.Errorf("Expected pinned pod A to retain affinity under static pinBoost=1, got A: %f, B: %f", scores[endpointA], scores[endpointB])
 	}
 }
 
-func TestColdStartLeastPinsBalancing(t *testing.T) {
-	// Pod A: Pinned by 10 programs
+func TestColdStartEqualScoring(t *testing.T) {
+	// Pod A: Idle (load = 0)
 	endpointA := scheduling.NewEndpoint(
 		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod-a"}},
 		&fwkdl.Metrics{WaitingQueueSize: 0},
 		nil,
 	)
 
-	// Pod B: Pinned by 1 program
+	// Pod B: Idle (load = 0)
 	endpointB := scheduling.NewEndpoint(
 		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod-b"}},
 		&fwkdl.Metrics{WaitingQueueSize: 0},
@@ -217,55 +218,13 @@ func TestColdStartLeastPinsBalancing(t *testing.T) {
 
 	ctx := context.Background()
 	p := programaware.New(ctx, "test-scorer", programaware.Config{})
-	for i := 0; i < 10; i++ {
-		p.SetPin(string(rune('A'+i)), endpointA.GetMetadata().GetNamespacedName().String())
-	}
-	p.SetPin("other-prog", endpointB.GetMetadata().GetNamespacedName().String())
 
 	// Brand new program (cold start)
 	req := &scheduling.InferenceRequest{FairnessID: "brand-new-program"}
 	scores := p.Score(ctx, req, []scheduling.Endpoint{endpointA, endpointB})
 
-	if scores[endpointB] <= scores[endpointA] {
-		t.Errorf("Expected less-pinned pod B to win cold start, got A: %f, B: %f", scores[endpointA], scores[endpointB])
-	}
-}
-
-func TestSpilloverOn100PercentWarmOverloadedRunning(t *testing.T) {
-	producerName := "test-producer"
-	matchKey := attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(producerName).String()
-
-	// Pod A: Pinned Home Pod with 100% cache hit, but heavily overloaded with running decodes (Running = 20, Queue = 0)
-	attrA := fwkdl.NewAttributes()
-	attrA.Put(matchKey, attrprefix.NewPrefixCacheMatchInfo(100, 100, 16))
-	endpointA := scheduling.NewEndpoint(
-		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod-a"}},
-		&fwkdl.Metrics{
-			RunningRequestsSize: 20,
-			WaitingQueueSize:    0,
-		},
-		attrA,
-	)
-
-	// Pod B: Idle Pod (Running = 0, Queue = 0, Cache = 0)
-	endpointB := scheduling.NewEndpoint(
-		&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod-b"}},
-		&fwkdl.Metrics{
-			RunningRequestsSize: 0,
-			WaitingQueueSize:    0,
-		},
-		nil,
-	)
-
-	ctx := context.Background()
-	p := programaware.New(ctx, "test-scorer", programaware.Config{PrefixMatchInfoProducerName: producerName})
-	p.SetPin("program-1", endpointA.GetMetadata().GetNamespacedName().String())
-
-	req := &scheduling.InferenceRequest{FairnessID: "program-1"}
-	scores := p.Score(ctx, req, []scheduling.Endpoint{endpointA, endpointB})
-
-	if scores[endpointB] <= scores[endpointA] {
-		t.Errorf("Expected idle pod B to win over overloaded warm pod A (20 running), got A: %f, B: %f", scores[endpointA], scores[endpointB])
+	if scores[endpointA] != 0.0 || scores[endpointB] != 0.0 {
+		t.Errorf("Expected cold start idle pods to score 0.0, got A: %f, B: %f", scores[endpointA], scores[endpointB])
 	}
 }
 
