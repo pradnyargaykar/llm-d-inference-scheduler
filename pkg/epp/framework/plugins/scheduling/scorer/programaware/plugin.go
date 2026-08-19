@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"sort"
 	"sync"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -20,55 +19,41 @@ import (
 )
 
 const (
-	// ProgramAwareScorerPluginType is the exported type name for registration
+	// ProgramAwareScorerPluginType is the exported type name for registration in the EPP plugin registry.
 	ProgramAwareScorerPluginType = ProgramAwareType
 	ProgramAwareType             = "program-aware-scorer"
 
+	// defaultMissThreshold is the consecutive off-pin route count before migrating a program's home pin.
 	defaultMissThreshold = 3
-	defaultMaxContext    = 32768
 )
 
-// Config defines the configuration for the program-aware scorer plugin
+// Config defines the configuration parameters for the program-aware scorer plugin.
 type Config struct {
-	// PrefixMatchInfoProducerName is the name of the data producer that produces PrefixCacheMatchInfo
+	// PrefixMatchInfoProducerName specifies the data producer that computes PrefixCacheMatchInfo (e.g. approx-prefix-cache-producer).
 	PrefixMatchInfoProducerName string `json:"prefixMatchInfoProducerName,omitempty"`
 
-	// MissThreshold for pin migration
+	// MissThreshold is the number of consecutive off-home-pod routes before transferring a program's pin commitment.
 	MissThreshold int `json:"missThreshold,omitempty"`
-
-	// Retained for backward compatibility with existing YAML configs
-	DefaultBudget        int64   `json:"defaultBudget,omitempty"`
-	RefreshAmount        int64   `json:"refreshAmount,omitempty"`
-	RefreshInterval      string  `json:"refreshInterval,omitempty"`
-	LowUtilThreshold     float64 `json:"lowUtilThreshold,omitempty"`
-	MediumUtilThreshold  float64 `json:"mediumUtilThreshold,omitempty"`
-	LowUtilMultiplier    float64 `json:"lowUtilMultiplier,omitempty"`
-	MediumUtilMultiplier float64 `json:"mediumUtilMultiplier,omitempty"`
-	HighUtilMultiplier   float64 `json:"highUtilMultiplier,omitempty"`
-	LoadCoefficient      float64 `json:"loadCoefficient,omitempty"`
-	KvCoefficient        float64 `json:"kvCoefficient,omitempty"`
-	RecomputeCoefficient float64 `json:"recomputeCoefficient,omitempty"`
-	QueueThreshold       float64 `json:"queueThreshold,omitempty"`
 }
 
-// Plugin implements the program-aware scoring logic
+// Plugin implements the program-aware scoring algorithm for agentic multi-turn workloads.
 type Plugin struct {
 	typedName          plugin.TypedName
 	prefixMatchDataKey plugin.DataKey
 
+	// Token tracking: monitors session context growth across turns to dynamically scale recompute penalties.
 	programTokens   map[string]int64
 	maxActiveTokens int64
 	tokensMu        sync.RWMutex
 
+	// Home-pod pin management & migration state.
 	mu            sync.RWMutex
-	pins          map[string]string
-	podCount      map[string]int
-	misses        map[string]int
-	rrCursor      int
+	pins          map[string]string // programID -> pinned pod ID
+	misses        map[string]int    // programID -> consecutive off-pin route count
 	missThreshold int
 }
 
-// compile-time type assertions
+// Compile-time interface compliance assertions.
 var (
 	_ scheduling.Scorer                    = &Plugin{}
 	_ plugin.ConsumerPlugin                = &Plugin{}
@@ -76,7 +61,7 @@ var (
 	_ requestcontrol.ResponseBodyProcessor = &Plugin{}
 )
 
-// Factory defines the factory function for the ProgramAware scorer
+// Factory instantiates the program-aware scorer plugin from raw JSON parameters.
 func Factory(name string, rawParameters *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
 	cfg := Config{}
 
@@ -93,10 +78,10 @@ func Factory(name string, rawParameters *json.Decoder, handle plugin.Handle) (pl
 	return New(handle.Context(), name, cfg), nil
 }
 
-// ProgramAwareScorerPluginFactory is the exported factory function for registration
+// ProgramAwareScorerPluginFactory is the exported factory variable for plugin registration.
 var ProgramAwareScorerPluginFactory = Factory
 
-// New creates a new program-aware scorer
+// New creates and initializes a new Program-Aware scorer instance.
 func New(ctx context.Context, name string, cfg Config) *Plugin {
 	missThreshold := defaultMissThreshold
 	if cfg.MissThreshold > 0 {
@@ -109,37 +94,39 @@ func New(ctx context.Context, name string, cfg Config) *Plugin {
 		programTokens:      make(map[string]int64),
 		maxActiveTokens:    1000,
 		pins:               make(map[string]string),
-		podCount:           make(map[string]int),
 		misses:             make(map[string]int),
 		missThreshold:      missThreshold,
 	}
 }
 
-// TypedName returns the type and name tuple of this plugin instance
+// TypedName returns the plugin's type and instance name.
 func (p *Plugin) TypedName() plugin.TypedName {
 	return p.typedName
 }
 
-// Category returns the preference the scorer applies
+// Category indicates the scheduling category (Affinity).
 func (p *Plugin) Category() scheduling.ScorerCategory {
 	return scheduling.Affinity
 }
 
-// Produces returns the data produced by the plugin.
+// Produces declares any data produced by this plugin (none).
 func (p *Plugin) Produces() map[plugin.DataKey]any {
 	return map[plugin.DataKey]any{}
 }
 
 // Consumes declares that this plugin requires PrefixCacheMatchInfo from the data producer.
-// This is critical for the EPP DAG to execute the precise-prefix-cache-producer!
 func (p *Plugin) Consumes() plugin.DataDependencies {
 	return plugin.DataDependencies{
 		Required: map[plugin.DataKey]any{p.prefixMatchDataKey: attrprefix.PrefixCacheMatchInfo{}},
 	}
 }
 
-// Score computes a parameter-free, model-agnostic score for candidate endpoints.
-// Formula: Score_i = 2.0*CacheScore + PinBoost - RelQueue - RecomputePenalty - 0.10*RelPins
+// Score evaluates all candidate endpoints and assigns each a score based on:
+//
+//	Score = CacheScore + PinBoost - RecomputePenalty - RelLoad
+//
+// All 4 components are naturally bounded to [0.0, 1.0], providing parameter-free balancing
+// between KV cache reuse, session stickiness, and load-aware spillover.
 func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, endpoints []scheduling.Endpoint) map[scheduling.Endpoint]float64 {
 	logger := log.FromContext(ctx)
 	scores := make(map[scheduling.Endpoint]float64, len(endpoints))
@@ -161,7 +148,8 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 	pinnedKey := p.pins[programID]
 	p.mu.RUnlock()
 
-	// 1. Relative KV Context Ratio (0.0 to 1.0) based on accumulated program tokens
+	// 1. Relative Context Growth Ratio: estimates the program's accumulated context depth
+	// relative to the longest active session in the workload (0.0 to 1.0).
 	if maxActive < 1000 {
 		maxActive = 1000
 	}
@@ -170,7 +158,7 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 		contextRatio = 1.0
 	}
 
-	// 2. Relative load bounds across current candidate endpoints
+	// 2. Discover Min/Max Load across candidate endpoints (Load = Running + Waiting).
 	minLoad := math.MaxInt32
 	maxLoad := math.MinInt32
 	hasWaiting := false
@@ -194,7 +182,7 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 		}
 	}
 
-	// 3. Compute score for each endpoint
+	// 3. Compute score for each candidate endpoint.
 	for _, endpoint := range endpoints {
 		podID := endpoint.GetMetadata().GetNamespacedName().String()
 		m := endpoint.GetMetrics()
@@ -206,39 +194,36 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 		}
 		load := running + waiting
 
-		// A. Prefix Cache Match Ratio (0.0 to 1.0)
+		// Component A: Prefix Cache Match Ratio (0.0 to 1.0)
 		cacheScore := p.getCacheScore(ctx, endpoint)
 
-		// B. Relative Load Congestion Penalty (0.0 to 1.0)
+		// Component B: Relative Load Congestion Penalty (0.0 to 1.0)
+		// Active only when there is a significant load spread (delta >= 3) or queue buildup.
 		relLoad := 0.0
 		if maxLoad > minLoad && (maxLoad-minLoad >= 3 || hasWaiting) {
 			relLoad = float64(load-minLoad) / float64(maxLoad-minLoad)
 		}
 
-		// C. Static Sticky Home-Pod Pin Boost (+1.0 if home pod, 0.0 otherwise)
+		// Component C: Sticky Home-Pod Pin Boost (+1.0 if home pod, 0.0 otherwise)
 		pinBoost := 0.0
 		if pinnedKey != "" && podID == pinnedKey {
 			pinBoost = 1.0
 		}
 
-		// D. Physical KV Cache Recompute Penalty
+		// Component D: Physical KV Cache Recompute Penalty (0.0 to 1.0)
+		// Penalizes migrating deep sessions to pods without cached prefix blocks.
 		recomputePenalty := (1.0 - cacheScore) * contextRatio
 
-		// Score = CacheScore + PinBoost - RecomputePenalty - RelLoad
+		// Final Scoring Formulation:
 		score := cacheScore + pinBoost - recomputePenalty - relLoad
 		scores[endpoint] = score
 
-		// Record metrics for observability
-		budgetAtScore.WithLabelValues(programID, podID).Set(score)
+		// Record telemetry metrics
+		endpointScore.WithLabelValues(programID, podID).Set(score)
 
 		decisionType := "cache_miss"
 		if cacheScore > 0 {
-			if relLoad >= 0.75 {
-				decisionType = "cache_hit_saturated_migrate"
-				forcedMigrationsTotal.WithLabelValues(programID, podID).Inc()
-			} else {
-				decisionType = "cache_hit"
-			}
+			decisionType = "cache_hit"
 		}
 		routingDecisionsTotal.WithLabelValues(programID, podID, decisionType).Inc()
 
@@ -259,36 +244,7 @@ func (p *Plugin) Score(ctx context.Context, req *scheduling.InferenceRequest, en
 	return scores
 }
 
-// leastLoadedPod returns the candidate pod pinned by the fewest programs.
-func (p *Plugin) leastLoadedPod(endpoints []scheduling.Endpoint) scheduling.Endpoint {
-	keys := make([]string, len(endpoints))
-	byKey := make(map[string]scheduling.Endpoint, len(endpoints))
-	for i, ep := range endpoints {
-		k := ep.GetMetadata().GetNamespacedName().String()
-		keys[i] = k
-		byKey[k] = ep
-	}
-	sort.Strings(keys)
-
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	minCount := -1
-	candidates := make([]string, 0, len(keys))
-	for _, k := range keys {
-		c := p.podCount[k]
-		switch {
-		case minCount == -1 || c < minCount:
-			minCount = c
-			candidates = append(candidates[:0], k)
-		case c == minCount:
-			candidates = append(candidates, k)
-		}
-	}
-	return byKey[candidates[p.rrCursor%len(candidates)]]
-}
-
-// PreRequest tracks pin commitments and token usage.
+// PreRequest commits pin assignments and manages dynamic pin migration when requests spill over.
 func (p *Plugin) PreRequest(ctx context.Context, req *scheduling.InferenceRequest, result *scheduling.SchedulingResult) {
 	if result == nil {
 		return
@@ -306,31 +262,28 @@ func (p *Plugin) PreRequest(ctx context.Context, req *scheduling.InferenceReques
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.rrCursor++
 
 	existing, pinned := p.pins[programID]
 	switch {
 	case !pinned:
+		// First request: pin program to the chosen pod.
 		p.pins[programID] = chosen
-		p.podCount[chosen]++
 		delete(p.misses, programID)
 	case existing == chosen:
+		// Routed to existing home pod: clear any previous off-pin miss counter.
 		delete(p.misses, programID)
 	default:
+		// Spilled over to a non-home pod: increment miss counter.
 		p.misses[programID]++
 		if p.misses[programID] >= p.missThreshold {
-			p.podCount[existing]--
-			if p.podCount[existing] <= 0 {
-				delete(p.podCount, existing)
-			}
+			// Threshold reached: migrate home pin commitment to the new pod.
 			p.pins[programID] = chosen
-			p.podCount[chosen]++
 			delete(p.misses, programID)
 		}
 	}
 }
 
-// ResponseBody processes token counts from response stream.
+// ResponseBody captures token usage upon stream completion to update session context depth.
 func (p *Plugin) ResponseBody(ctx context.Context, req *scheduling.InferenceRequest, resp *requestcontrol.Response, targetEndpoint *datalayer.EndpointMetadata) {
 	if !resp.EndOfStream {
 		return
@@ -364,22 +317,21 @@ func (p *Plugin) ResponseBody(ctx context.Context, req *scheduling.InferenceRequ
 		"maxActiveTokens", p.maxActiveTokens)
 }
 
-// SetPin sets the pinned pod ID for a program ID (used for testing)
+// SetPin manually sets the pinned pod ID for a program (used in unit tests).
 func (p *Plugin) SetPin(programID string, podID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.pins[programID] = podID
-	p.podCount[podID]++
 }
 
-// GetProgramTokens returns the accumulated tokens for a program ID (used for testing)
+// GetProgramTokens returns the accumulated tokens for a program ID (used in unit tests).
 func (p *Plugin) GetProgramTokens(programID string) int64 {
 	p.tokensMu.RLock()
 	defer p.tokensMu.RUnlock()
 	return p.programTokens[programID]
 }
 
-// SetProgramTokens sets the accumulated tokens for a program ID (used for testing)
+// SetProgramTokens manually sets the accumulated tokens for a program ID (used in unit tests).
 func (p *Plugin) SetProgramTokens(programID string, tokens int64) {
 	p.tokensMu.Lock()
 	defer p.tokensMu.Unlock()
@@ -389,7 +341,7 @@ func (p *Plugin) SetProgramTokens(programID string, tokens int64) {
 	}
 }
 
-// getCacheScore retrieves the cache hit score (0.0 to 1.0)
+// getCacheScore retrieves the normalized prefix cache match ratio [0.0, 1.0] for an endpoint.
 func (p *Plugin) getCacheScore(ctx context.Context, endpoint scheduling.Endpoint) float64 {
 	info, ok := endpoint.Get(p.prefixMatchDataKey.String())
 	if !ok {
@@ -404,7 +356,7 @@ func (p *Plugin) getCacheScore(ctx context.Context, endpoint scheduling.Endpoint
 	return float64(prefixMatchInfo.MatchBlocks()) / float64(prefixMatchInfo.TotalBlocks())
 }
 
-// chosenPod extracts the pod selected by the picker
+// chosenPod extracts the selected endpoint's namespaced name from the scheduling result.
 func chosenPod(result *scheduling.SchedulingResult) (string, bool) {
 	if result == nil {
 		return "", false
